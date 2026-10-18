@@ -29,6 +29,24 @@ enum Prompts {
         return run(alert) == .alertFirstButtonReturn
     }
 
+    enum Choice { case confirm, alternate, cancel }
+
+    /// Three buttons: `confirm` is the default, `alternate` is shown in the destructive (red) style.
+    static func choose(_ title: String, _ detail: String, confirm: String, alternate: String) -> Choice {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = title
+        alert.informativeText = detail
+        alert.addButton(withTitle: confirm)
+        alert.addButton(withTitle: alternate).hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        switch run(alert) {
+        case .alertFirstButtonReturn: return .confirm
+        case .alertSecondButtonReturn: return .alternate
+        default: return .cancel
+        }
+    }
+
     static func name(_ title: String, _ detail: String, initial: String, confirm: String,
                      check: (String) -> String? = { _ in nil }) -> String? {
         var value = initial

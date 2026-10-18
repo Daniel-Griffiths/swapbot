@@ -38,7 +38,7 @@ Click the robot in the menu bar:
 The icon shows a `?` badge when the current login isn't saved and an `×` badge when Claude Code is signed out.
 
 > [!NOTE]
-> Switching, adding an account or logging in again quits any running Claude Code sessions first, after asking. A session left running would carry on under the new account and resend its whole conversation without the old account's cache, which gets expensive for long conversations. Conversations are saved, so `claude --resume` picks them up again.
+> Switching, adding an account or logging in again asks first if Claude Code sessions are running: quit them, continue anyway, or cancel. A session left running carries on under the new account and resends its whole conversation without the old account's cache, which gets expensive for long conversations. Quit sessions' conversations are saved, so `claude --resume` picks them up again.
 
 ## How it works
 

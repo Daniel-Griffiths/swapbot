@@ -273,7 +273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             return
         }
-        guard quitSessions(before: "Switching to “\(name)”") else { return }
+        guard quitSessions(before: "switching to “\(name)”") else { return }
         recordOutgoingUsage { [self] in
             do {
                 try store.use(name)
@@ -371,7 +371,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func startLogin(relogin: String?) {
-        guard !isBusy, quitSessions(before: relogin == nil ? "Adding an account" : "Logging in again") else { return }
+        guard !isBusy, quitSessions(before: relogin == nil ? "adding an account" : "logging in again") else { return }
         recordOutgoingUsage { [self] in openLogin(relogin: relogin) }
     }
 
@@ -434,11 +434,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let pids = Sessions.runningClaudeSessions()
         guard !pids.isEmpty else { return true }
         let sessions = pids.count == 1 ? "1 Claude Code session" : "\(pids.count) Claude Code sessions"
-        guard Prompts.confirm(
-            "\(what) quits \(sessions)",
-            "Sessions left running would carry on under the new account, resending their whole conversation without the old account's cache.\n\nTheir conversations are saved. Pick them up later with claude --resume.",
-            confirm: "Quit & Continue"
-        ) else { return false }
+        switch Prompts.choose(
+            "Quit \(sessions) before \(what)?",
+            "Sessions left running carry on under the new account, resending their whole conversation without the old account's cache.\n\nQuit sessions' conversations are saved. Pick them up later with claude --resume.",
+            confirm: "Quit Sessions",
+            alternate: "Continue Anyway"
+        ) {
+        case .cancel: return false
+        case .alternate:
+            return Prompts.confirm(
+                "Leaving sessions running can use a lot of your usage",
+                "The prompt cache doesn't carry over to the new account. The next message in each running session resends its whole conversation uncached, which can take a big chunk of the new account's session usage straight away. Long conversations cost the most.",
+                confirm: "Yes, I’m Sure",
+                destructive: true
+            )
+        case .confirm: break
+        }
         let survivors = Processes.terminate(pids)
         if !survivors.isEmpty {
             Prompts.info("Couldn't quit every session", "\(survivors.count) Claude Code process\(survivors.count == 1 ? "" : "es") (PID \(survivors.map(String.init).joined(separator: ", "))) is still running, so nothing was changed.")
