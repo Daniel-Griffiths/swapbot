@@ -25,6 +25,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             dump(ProfileStore())
             return
         }
+        if CommandLine.arguments.contains("--list") {
+            list(ProfileStore())
+            return
+        }
+        if let i = CommandLine.arguments.firstIndex(of: "--switch"), i + 1 < CommandLine.arguments.count {
+            exit(switchAccount(ProfileStore(), to: CommandLine.arguments[i + 1],
+                               quitSessions: CommandLine.arguments.contains("--quit-sessions")))
+        }
         if let i = CommandLine.arguments.firstIndex(of: "--render-app-icon"), i + 1 < CommandLine.arguments.count {
             RobotIcon.writeAppIconset(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
             return
@@ -481,6 +489,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let tip = item.toolTip { print(pad + "    [tooltip] " + tip.replacingOccurrences(of: "\n", with: " | ")) }
             if let sub = item.submenu { printMenu(sub, depth: depth + 1) }
         }
+    }
+
+    private static func list(_ store: ProfileStore) {
+        let profiles = store.profiles(includeTokens: false)
+        let active = store.activeProfile(in: profiles)
+        for p in profiles {
+            let usage = p.usage.map { usage in
+                usage.windows.map { window in
+                    window.hasReset() ? "\(window.name) has reset" : "\(window.name) \(Int(window.percent.rounded()))%"
+                }.joined(separator: ", ")
+            } ?? "no usage recorded"
+            print("\(p.name == active?.name ? "*" : " ") \(p.name)  \(p.account?.email ?? "?")  \(usage)")
+        }
+    }
+
+    private static func switchAccount(_ store: ProfileStore, to name: String, quitSessions: Bool) -> Int32 {
+        guard let profile = store.profiles().first(where: { $0.name == name }) else {
+            print("no saved account named “\(name)”")
+            return 1
+        }
+        let outgoing = store.activeProfile()?.name
+        if outgoing == name {
+            print("already using “\(name)”")
+            return 0
+        }
+        guard let tokens = profile.tokens, tokens.hasTokens, !tokens.isRefreshExpired() else {
+            print("the saved login for “\(name)” has expired; use Log In Again from the menu")
+            return 1
+        }
+        let pids = Sessions.runningClaudeSessions()
+        if !pids.isEmpty {
+            guard quitSessions else {
+                print("\(pids.count) Claude Code session\(pids.count == 1 ? " is" : "s are") running; pass --quit-sessions to quit \(pids.count == 1 ? "it" : "them") first")
+                return 1
+            }
+            let survivors = Processes.terminate(pids)
+            guard survivors.isEmpty else {
+                print("couldn't quit PID \(survivors.map(String.init).joined(separator: ", ")), so nothing was changed")
+                return 1
+            }
+        }
+        if let outgoing { store.recordUsage(for: outgoing) }
+        do {
+            try store.use(name)
+        } catch {
+            print("couldn't switch to “\(name)”: \(error.localizedDescription)")
+            return 1
+        }
+        print("switched to “\(name)” (\(profile.account?.email ?? "unknown account"))")
+        return 0
     }
 
     private static func dump(_ store: ProfileStore) {

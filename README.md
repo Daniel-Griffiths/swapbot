@@ -51,6 +51,16 @@ Switching replaces only `claudeAiOauth` on the live item, so MCP server tokens (
 
 The Keychain is accessed through `/usr/bin/security` rather than Security.framework. That tool is already on the items' access list, so there are no Keychain prompts, and Claude Code can read everything SwapBot writes.
 
+## Command line
+
+```sh
+~/Applications/SwapBot.app/Contents/MacOS/SwapBot --list                          # saved accounts and their last recorded usage
+~/Applications/SwapBot.app/Contents/MacOS/SwapBot --switch <name>                 # switch to a saved account
+~/Applications/SwapBot.app/Contents/MacOS/SwapBot --switch <name> --quit-sessions # quit running Claude Code sessions first
+```
+
+`--switch` works like clicking an account: it records the outgoing account's usage, then swaps the login. It refuses while Claude Code sessions are running unless you pass `--quit-sessions`.
+
 ## Development
 
 ```sh
