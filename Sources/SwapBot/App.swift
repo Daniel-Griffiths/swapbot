@@ -187,6 +187,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let name = action("Show Account Name in Menu Bar", #selector(toggleShowName))
         name.state = showsName ? .on : .off
         settingsMenu.addItem(name)
+        let awake = action("Stay Awake with Lid Closed", #selector(toggleSleepDisabled))
+        awake.state = Power.sleepDisabled ? .on : .off
+        awake.toolTip = "Stops the Mac sleeping at all, even with the lid closed or after SwapBot quits, until you turn this off. Needs an administrator password."
+        settingsMenu.addItem(awake)
         settings.submenu = settingsMenu
         menu.addItem(settings)
         menu.addItem(.separator())
@@ -362,6 +366,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         } catch {
             Prompts.error(error, title: "Couldn't change Launch at Login")
+        }
+    }
+
+    @objc private func toggleSleepDisabled() {
+        do {
+            try Power.setSleepDisabled(!Power.sleepDisabled)
+        } catch {
+            Prompts.error(error, title: "Couldn't change Stay Awake with Lid Closed")
         }
     }
 

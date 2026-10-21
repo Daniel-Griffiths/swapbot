@@ -33,7 +33,7 @@ Click the robot in the menu bar:
 - **Add Account…** opens Terminal running `claude auth login`. Sign in there and SwapBot asks what to call the new account. You don't need to log out of the current account first. It's saved before the new login replaces it.
 - **Save Current Login…** appears when you're signed in to an account that isn't saved yet, for example after running `/login` in Claude Code.
 - **Manage Accounts:** Log In Again (for an expiring login), Rename, Remove.
-- **Settings:** Launch at Login, and whether the account name appears next to the icon.
+- **Settings:** Launch at Login, whether the account name appears next to the icon, and Stay Awake with Lid Closed. That last one runs `pmset -a disablesleep` and asks for your administrator password. The Mac then doesn't sleep at all, even after SwapBot quits, until you turn it off.
 
 The icon shows a `?` badge when the current login isn't saved and an `×` badge when Claude Code is signed out.
 
