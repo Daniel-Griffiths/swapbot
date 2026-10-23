@@ -217,6 +217,16 @@ extension ProfileStoreTests {
     #expect(Usage(claudeOutput: "Unknown command: /usage") == nil)
 }
 
+@Test func onlyAccountsInTheSameOrganizationSharePromptCache() throws {
+    let alice = try #require(AccountInfo(["accountUuid": "a", "organizationUuid": "team"]))
+    let bob = try #require(AccountInfo(["accountUuid": "b", "organizationUuid": "team"]))
+    let personal = try #require(AccountInfo(["accountUuid": "a", "organizationUuid": "solo"]))
+    let unknown = try #require(AccountInfo(["accountUuid": "c"]))
+    #expect(alice.sharesPromptCache(with: bob))
+    #expect(!alice.sharesPromptCache(with: personal))
+    #expect(!unknown.sharesPromptCache(with: AccountInfo(["accountUuid": "d"])!))
+}
+
 @Test func usageResetsInJanuaryRollIntoNextYear() throws {
     let now = try #require(ISO8601DateFormatter().date(from: "2026-12-30T12:00:00Z"))
     let date = try #require(Usage.parseReset("Jan 2 at 9am (Europe/London)", now: now))

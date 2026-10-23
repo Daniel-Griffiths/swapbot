@@ -38,7 +38,7 @@ Click the robot in the menu bar:
 The icon shows a `?` badge when the current login isn't saved and an `×` badge when Claude Code is signed out.
 
 > [!NOTE]
-> Switching, adding an account or logging in again asks first if Claude Code sessions are running: quit them, continue anyway, or cancel. A session left running carries on under the new account and resends its whole conversation without the old account's cache, which gets expensive for long conversations. Quit sessions' conversations are saved, so `claude --resume` picks them up again.
+> Switching, adding an account or logging in again asks first if Claude Code sessions are running: quit them, continue anyway, or cancel. A session left running carries on under the new account and resends its whole conversation without the old account's cache, which gets expensive for long conversations. Quit sessions' conversations are saved, so `claude --resume` picks them up again. Switching between two accounts in the same team skips this, because a team's accounts share one prompt cache.
 
 ## How it works
 
@@ -59,7 +59,7 @@ The Keychain is accessed through `/usr/bin/security` rather than Security.framew
 ~/Applications/SwapBot.app/Contents/MacOS/SwapBot --switch <name> --quit-sessions # quit running Claude Code sessions first
 ```
 
-`--switch` works like clicking an account: it records the outgoing account's usage, then swaps the login. It refuses while Claude Code sessions are running unless you pass `--quit-sessions`.
+`--switch` works like clicking an account: it records the outgoing account's usage, then swaps the login. It refuses while Claude Code sessions are running unless you pass `--quit-sessions`, except when both accounts are in the same team.
 
 ## Development
 

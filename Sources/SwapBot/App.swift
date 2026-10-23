@@ -277,7 +277,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             return
         }
-        guard quitSessions(before: "switching to “\(name)”") else { return }
+        let sameTeam = store.currentAccount().flatMap { current in profile?.account?.sharesPromptCache(with: current) } ?? false
+        guard sameTeam || quitSessions(before: "switching to “\(name)”") else { return }
         recordOutgoingUsage { [self] in
             do {
                 try store.use(name)
@@ -541,7 +542,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             print("the saved login for “\(name)” has expired; use Log In Again from the menu")
             return 1
         }
-        let pids = Sessions.runningClaudeSessions()
+        let sameTeam = store.currentAccount().flatMap { profile.account?.sharesPromptCache(with: $0) } ?? false
+        let pids = sameTeam ? [] : Sessions.runningClaudeSessions()
         if !pids.isEmpty {
             guard quitSessions else {
                 print("\(pids.count) Claude Code session\(pids.count == 1 ? " is" : "s are") running; pass --quit-sessions to quit \(pids.count == 1 ? "it" : "them") first")

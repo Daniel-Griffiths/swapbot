@@ -55,6 +55,12 @@ public struct AccountInfo: Equatable, Sendable {
         }
         return email != nil && email == other.email
     }
+
+    /// Prompt caches are scoped to the organization, so a running session keeps its cache when
+    /// switching between two members of the same team.
+    public func sharesPromptCache(with other: AccountInfo) -> Bool {
+        organizationUuid != nil && organizationUuid == other.organizationUuid
+    }
 }
 
 public struct TokenInfo: Equatable, Sendable {
