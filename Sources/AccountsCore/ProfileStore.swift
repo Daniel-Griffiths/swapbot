@@ -4,11 +4,13 @@ public struct Paths: Sendable {
     public var service: String
     public var profileDir: URL
     public var claudeJSON: URL
+    public var claudeSettings: URL
 
-    public init(service: String, profileDir: URL, claudeJSON: URL) {
+    public init(service: String, profileDir: URL, claudeJSON: URL, claudeSettings: URL) {
         self.service = service
         self.profileDir = profileDir
         self.claudeJSON = claudeJSON
+        self.claudeSettings = claudeSettings
     }
 
     public static func live(environment env: [String: String] = ProcessInfo.processInfo.environment) -> Paths {
@@ -18,7 +20,9 @@ public struct Paths: Sendable {
             profileDir: env["SWAPBOT_PROFILE_DIR"].map { URL(fileURLWithPath: $0) }
                 ?? home.appendingPathComponent(".claude/account-profiles"),
             claudeJSON: env["SWAPBOT_CLAUDE_JSON"].map { URL(fileURLWithPath: $0) }
-                ?? home.appendingPathComponent(".claude.json")
+                ?? home.appendingPathComponent(".claude.json"),
+            claudeSettings: env["SWAPBOT_CLAUDE_SETTINGS"].map { URL(fileURLWithPath: $0) }
+                ?? home.appendingPathComponent(".claude/settings.json")
         )
     }
 }
@@ -40,19 +44,33 @@ public final class ProfileStore {
     }
 
     public func profiles(includeTokens: Bool = true) -> [Profile] {
+        load(includeTokens: includeTokens, live: false).profiles
+    }
+
+    public func profilesAndLiveTokens() -> (profiles: [Profile], live: TokenInfo?) {
+        load(includeTokens: true, live: true)
+    }
+
+    func load(includeTokens: Bool, live: Bool) -> (profiles: [Profile], live: TokenInfo?) {
         let files = (try? FileManager.default.contentsOfDirectory(at: paths.profileDir, includingPropertiesForKeys: nil)) ?? []
-        return files
+        let names = files
             .filter { $0.lastPathComponent.hasSuffix(".meta.json") }
             .map { String($0.lastPathComponent.dropLast(".meta.json".count)) }
             .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
-            .map { name in
-                Profile(
-                    name: name,
-                    account: AccountInfo(readMeta(name)?["oauthAccount"]),
-                    tokens: includeTokens ? snapshotOAuth(name).map(TokenInfo.init) : nil,
-                    usage: readUsage(name)
-                )
-            }
+        var services = includeTokens ? names.map(snapshotService) : []
+        if live { services.append(paths.service) }
+        let tokens = keychain.read(services).map { raw in
+            (raw.flatMap(Self.parseObject)?["claudeAiOauth"] as? [String: Any]).map(TokenInfo.init)
+        }
+        let profiles = names.enumerated().map { i, name in
+            Profile(
+                name: name,
+                account: AccountInfo(readMeta(name)?["oauthAccount"]),
+                tokens: includeTokens ? tokens[i] : nil,
+                usage: readUsage(name)
+            )
+        }
+        return (profiles, live ? tokens.last ?? nil : nil)
     }
 
     public func currentAccount() -> AccountInfo? {
@@ -122,17 +140,35 @@ public final class ProfileStore {
         try keychain.delete(snapshotService(name))
         try FileManager.default.removeItem(at: metaURL(name))
         try? FileManager.default.removeItem(at: usageURL(name))
+        AutoSwitch(store: self).update { $0.move(name, to: nil) }
     }
 
     @discardableResult
     public func recordUsage(for name: String, fetch: () -> Usage? = { ClaudeCLI.usage() }) -> Usage? {
         guard exists(name), let usage = fetch() else { return nil }
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(usage) else { return nil }
-        try? data.write(to: usageURL(name), options: .atomic)
+        writeUsage(usage, for: name)
         return usage
+    }
+
+    public func recordLimit(_ limit: UsageLimit, for name: String, now: Date = Date()) {
+        guard exists(name) else { return }
+        writeUsage((readUsage(name) ?? Usage(windows: [], recordedAt: now)).marking(limit, now: now), for: name)
+    }
+
+    @discardableResult
+    public func importCachedUsage() -> String? {
+        guard let config = try? readClaudeJSON(), let cached = CachedUsage(config["cachedUsageUtilization"]) else {
+            return nil
+        }
+        let all = profiles(includeTokens: false)
+        var matches = all.filter { $0.account?.accountUuid == cached.accountUuid }
+        if matches.count > 1, let active = activeProfile(in: all), matches.contains(active) {
+            matches = [active]
+        }
+        guard matches.count == 1, let profile = matches.first else { return nil }
+        if let existing = profile.usage, existing.recordedAt >= cached.usage.recordedAt { return nil }
+        writeUsage(cached.usage, for: profile.name)
+        return profile.name
     }
 
     public func rename(_ name: String, to newName: String) throws {
@@ -146,6 +182,7 @@ public final class ProfileStore {
         try FileManager.default.moveItem(at: metaURL(name), to: metaURL(newName))
         try? FileManager.default.moveItem(at: usageURL(name), to: usageURL(newName))
         try keychain.delete(snapshotService(name))
+        AutoSwitch(store: self).update { $0.renameMember(name, to: newName) }
     }
 
     public static func validate(_ name: String) throws {
@@ -177,6 +214,14 @@ public final class ProfileStore {
     func metaURL(_ name: String) -> URL { paths.profileDir.appendingPathComponent("\(name).meta.json") }
 
     func usageURL(_ name: String) -> URL { paths.profileDir.appendingPathComponent("\(name).usage.json") }
+
+    func writeUsage(_ usage: Usage, for name: String) {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(usage) else { return }
+        try? data.write(to: usageURL(name), options: .atomic)
+    }
 
     func readUsage(_ name: String) -> Usage? {
         guard let data = try? Data(contentsOf: usageURL(name)) else { return nil }

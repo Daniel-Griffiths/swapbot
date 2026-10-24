@@ -10,19 +10,21 @@ final class ProfileStoreTests {
     let store: ProfileStore
 
     static let work = ["accountUuid": "acc-work", "organizationUuid": "org-work", "emailAddress": "me@work.example", "organizationName": "Work"]
+    static let work2 = ["accountUuid": "acc-work2", "organizationUuid": "org-work", "emailAddress": "me2@work.example", "organizationName": "Work"]
     static let personal = ["accountUuid": "acc-me", "organizationUuid": "org-me", "emailAddress": "me@home.example", "organizationName": "Me"]
 
     init() throws {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         store = ProfileStore(
             paths: Paths(service: service, profileDir: dir.appendingPathComponent("profiles"),
-                         claudeJSON: dir.appendingPathComponent("claude.json")),
+                         claudeJSON: dir.appendingPathComponent("claude.json"),
+                         claudeSettings: dir.appendingPathComponent("settings.json")),
             keychain: keychain
         )
     }
 
     deinit {
-        for suffix in ["", ":work", ":personal", ":home", ":dead"] {
+        for suffix in ["", ":work", ":work2", ":personal", ":home", ":dead"] {
             try? keychain.delete(service + suffix)
         }
         try? FileManager.default.removeItem(at: dir)
@@ -136,7 +138,8 @@ final class ProfileStoreTests {
 @Test(.enabled(if: ProcessInfo.processInfo.environment["SWAPBOT_ROUNDTRIP"] != nil))
 func roundTripRealConfigCopy() throws {
     let url = URL(fileURLWithPath: ProcessInfo.processInfo.environment["SWAPBOT_ROUNDTRIP"]!)
-    let store = ProfileStore(paths: Paths(service: "unused", profileDir: url.deletingLastPathComponent(), claudeJSON: url))
+    let store = ProfileStore(paths: Paths(service: "unused", profileDir: url.deletingLastPathComponent(), claudeJSON: url,
+                                          claudeSettings: url.deletingLastPathComponent().appendingPathComponent("settings.json")))
     func canonical() throws -> Data {
         let object = try JSONSerialization.jsonObject(with: Data(contentsOf: url))
         return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
@@ -244,4 +247,173 @@ extension ProfileStoreTests {
 func readsUsageFromClaude() throws {
     let usage = try #require(ClaudeCLI.usage())
     print("live usage: " + usage.windows.map { "\($0.name) \($0.percent)% resets \($0.resetsText ?? "?")" }.joined(separator: " | "))
+}
+
+extension ProfileStoreTests {
+    func saveAccounts() throws {
+        try login(Self.work2, user: "u-work2", access: "a-work2", refresh: "r-work2")
+        try store.save(as: "work2")
+        try login(Self.personal, user: "u-me", access: "a-me", refresh: "r-me")
+        try store.save(as: "personal")
+        try login(Self.work, user: "u-work", access: "a-work", refresh: "r-work")
+        try store.save(as: "work")
+    }
+
+    @Test func usageLimitSwitchesToTheLeastUsedAccountInTheGroup() throws {
+        try saveAccounts()
+        let autoSwitch = AutoSwitch(store: store)
+        try autoSwitch.save(AutoSwitchSettings(groups: [FallbackGroup(name: "Work", members: ["work", "work2"])]))
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-10-17T11:15:00Z"))
+
+        let outcome = autoSwitch.handleLimit(message: "You've hit your session limit · resets 3:20pm (Europe/London)", now: now)
+        #expect(outcome == .switched(from: "work", to: "work2"))
+        #expect(store.activeProfile()?.name == "work2")
+        let session = store.profiles().first { $0.name == "work" }?.usage?.windows.first
+        #expect(session?.percent == 100)
+        #expect(session?.resetsAt == ISO8601DateFormatter().date(from: "2026-10-17T14:20:00Z"))
+
+        let again = autoSwitch.handleLimit(message: "You've hit your session limit · resets 3:20pm (Europe/London)",
+                                           now: now.addingTimeInterval(5))
+        #expect(again == .ignored("switched 5s ago"))
+        #expect(store.activeProfile()?.name == "work2")
+        #expect(store.profiles().first { $0.name == "work2" }?.usage == nil)
+    }
+
+    @Test func usageLimitMovesToTheNextGroupOnlyWhenTheGroupIsUsedUp() throws {
+        try saveAccounts()
+        let autoSwitch = AutoSwitch(store: store)
+        let now = Date()
+        try autoSwitch.save(AutoSwitchSettings(groups: [FallbackGroup(name: "Home", members: ["personal"])]))
+        #expect(autoSwitch.handleLimit(message: "You've hit your session limit · resets 3:20pm", now: now)
+            == .ignored("“work” hit its session limit; it isn't in a fallback group"))
+
+        let home = FallbackGroup(name: "Home", members: ["personal"])
+        try autoSwitch.save(AutoSwitchSettings(groups: [FallbackGroup(name: "Work", members: ["work", "work2"]), home]))
+        store.recordUsage(for: "work2") { Usage(windows: [UsageWindow(name: "Week", percent: 100, resetsAt: now.addingTimeInterval(3600))]) }
+        #expect(autoSwitch.handleLimit(message: "You've hit your weekly limit · resets Oct 25 at 6pm", now: now)
+            == .ignored("“work” hit its week limit; no account in its fallback groups has usage left"))
+
+        try autoSwitch.save(AutoSwitchSettings(groups: [FallbackGroup(name: "Work", members: ["work", "work2"], next: home.id), home]))
+        #expect(autoSwitch.handleLimit(message: "You've hit your weekly limit", now: now) == .switched(from: "work", to: "personal"))
+    }
+
+    @Test func serverRateLimitsDontCount() throws {
+        try saveAccounts()
+        let autoSwitch = AutoSwitch(store: store)
+        try autoSwitch.save(AutoSwitchSettings(groups: [FallbackGroup(name: "All", members: ["work", "work2", "personal"])]))
+        #expect(autoSwitch.handleLimit(message: "API Error: Rate limit reached") == .ignored("not a usage limit: API Error: Rate limit reached"))
+        #expect(store.activeProfile()?.name == "work")
+    }
+
+    @Test func fallbackSkipsUsedUpAndExpiredAccountsAndStopsAtLoops() throws {
+        let now = Date()
+        func profile(_ name: String, percent: Double?, resetsAt: Date? = nil, expired: Bool = false) -> Profile {
+            let expiry = (expired ? now.addingTimeInterval(-60) : now.addingTimeInterval(86_400)).timeIntervalSince1970 * 1000
+            return Profile(
+                name: name,
+                account: AccountInfo(["accountUuid": name, "organizationUuid": "org"]),
+                tokens: TokenInfo(["accessToken": "a", "refreshToken": "r", "refreshTokenExpiresAt": expiry]),
+                usage: percent.map { Usage(windows: [UsageWindow(name: "Session", percent: $0, resetsAt: resetsAt)]) }
+            )
+        }
+        let active = profile("a", percent: 100)
+        let profiles = [
+            active,
+            profile("b", percent: 40),
+            profile("c", percent: 100, resetsAt: now.addingTimeInterval(-60)),
+            profile("d", percent: 0, expired: true),
+            profile("e", percent: nil),
+            profile("f", percent: 100, resetsAt: now.addingTimeInterval(3600)),
+        ]
+        var first = FallbackGroup(name: "First", members: ["a", "b", "c", "d"])
+        var second = FallbackGroup(name: "Second", members: ["e", "f"])
+        #expect(AutoSwitch.fallback(from: active, in: profiles, settings: AutoSwitchSettings(groups: [first, second]), now: now)?.name == "c")
+
+        first.members = ["a", "d", "f"]
+        #expect(AutoSwitch.fallback(from: active, in: profiles, settings: AutoSwitchSettings(groups: [first, second]), now: now) == nil)
+        first.next = second.id
+        second.next = first.id
+        #expect(AutoSwitch.fallback(from: active, in: profiles, settings: AutoSwitchSettings(groups: [first, second]), now: now)?.name == "e")
+        second.members = ["f"]
+        #expect(AutoSwitch.fallback(from: active, in: profiles, settings: AutoSwitchSettings(groups: [first, second]), now: now) == nil)
+        #expect(AutoSwitch.fallback(from: profile("z", percent: 100), in: profiles, settings: AutoSwitchSettings(groups: [first, second]), now: now) == nil)
+    }
+
+    @Test func defaultGroupsFollowOrganizationsAndTrackRenamesAndRemovals() throws {
+        try saveAccounts()
+        let autoSwitch = AutoSwitch(store: store)
+        let defaults = autoSwitch.settings()
+        #expect(defaults.groups.map(\.name) == ["Me", "Work"])
+        #expect(defaults.groups.map(\.members) == [["personal"], ["work", "work2"]])
+
+        try autoSwitch.save(defaults)
+        try store.rename("work2", to: "home")
+        #expect(autoSwitch.settings().group(containing: "home")?.name == "Work")
+        try store.remove("home")
+        #expect(autoSwitch.settings().groups.map(\.members) == [["personal"], ["work"]])
+
+        var settings = autoSwitch.settings()
+        let work = try #require(settings.group(containing: "work"))
+        settings.groups[0].next = work.id
+        settings.move("personal", to: work.id)
+        settings.remove(group: work.id)
+        #expect(settings.groups.count == 1)
+        #expect(settings.groups[0].next == nil)
+        #expect(settings.group(containing: "personal") == nil)
+    }
+
+    @Test func importsUsageClaudeCodeCachedForTheMatchingAccount() throws {
+        try saveAccounts()
+        var config = try store.readClaudeJSON()
+        config["cachedUsageUtilization"] = [
+            "accountUuid": "acc-me",
+            "fetchedAtMs": 1_792_796_588_055,
+            "utilization": [
+                "five_hour": ["utilization": 77, "resets_at": "2026-10-24T01:39:59.896789+00:00"],
+                "seven_day": ["utilization": 84, "resets_at": "2026-10-25T17:59:59.896807+00:00"],
+                "seven_day_opus": NSNull(),
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: config).write(to: store.paths.claudeJSON)
+
+        #expect(store.importCachedUsage() == "personal")
+        let usage = try #require(store.profiles().first { $0.name == "personal" }?.usage)
+        #expect(usage.windows.map(\.name) == ["Session", "Week"])
+        #expect(usage.windows.map(\.percent) == [77, 84])
+        #expect(usage.windows[0].resetsAt == ISO8601DateFormatter().date(from: "2026-10-24T01:39:59Z"))
+        #expect(store.importCachedUsage() == nil)
+    }
+
+    @Test func hookInstallKeepsOtherHooksAndRemovesOnlyItsOwn() throws {
+        let hooks = ClaudeHooks(settingsURL: store.paths.claudeSettings)
+        let existing: [String: Any] = [
+            "model": "opus",
+            "hooks": [
+                "Stop": [["hooks": [["type": "command", "command": "say done"]]]],
+                "StopFailure": [["matcher": "rate_limit", "hooks": [["type": "command", "command": "say limited"]]]],
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: existing).write(to: store.paths.claudeSettings)
+
+        try hooks.install(executable: "/Applications/SwapBot.app/Contents/MacOS/SwapBot")
+        try hooks.install(executable: "/Users/me/Applications/SwapBot.app/Contents/MacOS/SwapBot")
+        #expect(hooks.installedCommand() == "'/Users/me/Applications/SwapBot.app/Contents/MacOS/SwapBot' --limit-reached")
+        var stopFailure = (try hooks.read()["hooks"] as? [String: Any])?["StopFailure"] as? [[String: Any]]
+        #expect(stopFailure?.count == 2)
+
+        try hooks.uninstall()
+        #expect(hooks.installedCommand() == nil)
+        let settings = try hooks.read()
+        stopFailure = (settings["hooks"] as? [String: Any])?["StopFailure"] as? [[String: Any]]
+        #expect(stopFailure?.count == 1)
+        #expect((settings["hooks"] as? [String: Any])?["Stop"] != nil)
+        #expect(settings["model"] as? String == "opus")
+    }
+
+    @Test func hookInstallLeavesInvalidSettingsAlone() throws {
+        try Data("{ not json".utf8).write(to: store.paths.claudeSettings)
+        let hooks = ClaudeHooks(settingsURL: store.paths.claudeSettings)
+        #expect(throws: AccountsError.self) { try hooks.install(executable: "/Applications/SwapBot.app/Contents/MacOS/SwapBot") }
+        #expect(try String(contentsOf: store.paths.claudeSettings, encoding: .utf8) == "{ not json")
+    }
 }

@@ -6,6 +6,7 @@ import ServiceManagement
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static var shared: AppDelegate?
+    private static let accountChanged = Notification.Name("com.danielgriffiths.SwapBot.accountChanged")
 
     static func main() {
         if let i = CommandLine.arguments.firstIndex(of: "--launch-at-login"), i + 1 < CommandLine.arguments.count {
@@ -23,6 +24,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if CommandLine.arguments.contains("--dump") {
             dump(ProfileStore())
+            return
+        }
+        if CommandLine.arguments.contains(ClaudeHooks.flag) {
+            limitReached(ProfileStore())
             return
         }
         if CommandLine.arguments.contains("--list") {
@@ -58,10 +63,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private let store = ProfileStore()
     var statusItem: NSStatusItem!
-    private var timer: Timer?
-    private var lastConfigChange: Date?
+    private var loginTimer: Timer?
     private var pendingLogin: PendingLogin?
     private var isBusy = false
+    private var sleepDisabled = Power.sleepDisabled
 
     private struct PendingLogin {
         let before: LoginFingerprint
@@ -80,28 +85,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         updateLabel()
+        store.importCachedUsage()
+        AutoSwitchWindow.refreshHookPath(store: store)
 
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
-            MainActor.assumeIsolated { AppDelegate.shared?.tick() }
+        DistributedNotificationCenter.default().addObserver(forName: Self.accountChanged, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { AppDelegate.shared?.updateLabel() }
         }
         if let i = CommandLine.arguments.firstIndex(of: "--screenshot"), i + 1 < CommandLine.arguments.count {
             captureMenu(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
         }
     }
 
-    private func tick() {
-        let modified = (try? store.paths.claudeJSON.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-        if modified != lastConfigChange {
-            lastConfigChange = modified
-            updateLabel()
+    func menuWillOpen(_ menu: NSMenu) {
+        store.importCachedUsage()
+        updateLabel()
+    }
+
+    private func waitForLogin(_ pending: PendingLogin) {
+        pendingLogin = pending
+        loginTimer?.invalidate()
+        loginTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
+            MainActor.assumeIsolated { AppDelegate.shared?.checkLogin() }
         }
-        guard let pending = pendingLogin else { return }
+    }
+
+    private func checkLogin() {
+        guard let pending = pendingLogin else { return stopWaitingForLogin() }
         if Date().timeIntervalSince(pending.started) > 15 * 60 {
-            pendingLogin = nil
+            stopWaitingForLogin()
         } else if store.fingerprint() != pending.before {
-            pendingLogin = nil
+            stopWaitingForLogin()
             loginFinished(pending)
         }
+    }
+
+    private func stopWaitingForLogin() {
+        pendingLogin = nil
+        loginTimer?.invalidate()
+        loginTimer = nil
     }
 
     private func updateLabel() {
@@ -128,10 +149,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        let profiles = store.profiles()
+        let (profiles, liveTokens) = store.profilesAndLiveTokens()
         let current = store.currentAccount()
         let active = store.activeProfile(in: profiles)
-        let liveTokens = store.currentTokens()
 
         let header: String
         if let current {
@@ -181,6 +201,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let settings = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
         let settingsMenu = NSMenu()
+        settingsMenu.addItem(action("Auto-Switch…", #selector(showAutoSwitch)))
+        settingsMenu.addItem(.separator())
         let login = action("Launch at Login", #selector(toggleLaunchAtLogin))
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         settingsMenu.addItem(login)
@@ -188,7 +210,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         name.state = showsName ? .on : .off
         settingsMenu.addItem(name)
         let awake = action("Stay Awake with Lid Closed", #selector(toggleSleepDisabled))
-        awake.state = Power.sleepDisabled ? .on : .off
+        awake.state = sleepDisabled ? .on : .off
         awake.toolTip = "Stops the Mac sleeping at all, even with the lid closed or after SwapBot quits, until you turn this off. Needs an administrator password."
         settingsMenu.addItem(awake)
         settings.submenu = settingsMenu
@@ -372,10 +394,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleSleepDisabled() {
         do {
-            try Power.setSleepDisabled(!Power.sleepDisabled)
+            try Power.setSleepDisabled(!sleepDisabled)
         } catch {
             Prompts.error(error, title: "Couldn't change Stay Awake with Lid Closed")
         }
+        sleepDisabled = Power.sleepDisabled
+    }
+
+    @objc private func showAutoSwitch() {
+        AutoSwitchWindow.show(store: store)
     }
 
     @objc private func toggleShowName() {
@@ -403,7 +430,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             echo
             echo "SwapBot will pick up the new login. You can close this window."
             """)
-            pendingLogin = PendingLogin(before: before, relogin: relogin, started: Date())
+            waitForLogin(PendingLogin(before: before, relogin: relogin, started: Date()))
         } catch {
             Prompts.error(error, title: "Couldn't open Terminal")
         }
@@ -562,8 +589,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             print("couldn't switch to “\(name)”: \(error.localizedDescription)")
             return 1
         }
+        postAccountChanged()
         print("switched to “\(name)” (\(profile.account?.email ?? "unknown account"))")
         return 0
+    }
+
+    private static func limitReached(_ store: ProfileStore) {
+        let input = FileHandle.standardInput.readDataToEndOfFile()
+        let event = (try? JSONSerialization.jsonObject(with: input)) as? [String: Any]
+        store.importCachedUsage()
+        let autoSwitch = AutoSwitch(store: store)
+        let outcome = autoSwitch.handleLimit(message: event?["last_assistant_message"] as? String ?? "")
+        autoSwitch.log(outcome)
+        if case .switched = outcome { postAccountChanged() }
+    }
+
+    private static func postAccountChanged() {
+        DistributedNotificationCenter.default().postNotificationName(accountChanged, object: nil, userInfo: nil, deliverImmediately: true)
     }
 
     private static func dump(_ store: ProfileStore) {

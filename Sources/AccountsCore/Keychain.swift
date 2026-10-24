@@ -22,6 +22,14 @@ public struct Keychain: Sendable {
         return value
     }
 
+    public func read(_ services: [String]) -> [String?] {
+        let results = Results(count: services.count)
+        DispatchQueue.concurrentPerform(iterations: services.count) { i in
+            results.set(i, try? read(services[i]))
+        }
+        return results.values
+    }
+
     public func write(_ service: String, _ value: String) throws {
         let r = Shell.run(tool, ["add-generic-password", "-U", "-s", service, "-a", account, "-w", value])
         guard r.status == 0 else {
@@ -36,6 +44,23 @@ public struct Keychain: Sendable {
         let r = Shell.run(tool, ["delete-generic-password", "-s", service, "-a", account])
         guard r.status == 0 || r.status == 44 else {
             throw AccountsError.keychain("couldn't delete \(service): \(r.stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+    }
+
+    private final class Results: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage: [String?]
+
+        init(count: Int) {
+            storage = Array(repeating: nil, count: count)
+        }
+
+        var values: [String?] {
+            lock.withLock { storage }
+        }
+
+        func set(_ index: Int, _ value: String?) {
+            lock.withLock { storage[index] = value }
         }
     }
 

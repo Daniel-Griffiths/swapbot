@@ -29,7 +29,8 @@ Click the robot in the menu bar:
 <img src="assets/screenshot.png" width="410" alt="SwapBot menu" />
 
 - **Switch:** click an account, or press its number while the menu is open. The account you're leaving is saved again first, so tokens Claude Code refreshed while it was in use aren't lost.
-- **Usage:** just before switching away from an account, SwapBot runs `claude -p "/usage"` to read its session and weekly usage. Hover over that account to see it, along with when each limit resets. Accounts you haven't switched away from yet have no usage.
+- **Usage:** just before switching away from an account, SwapBot runs `claude -p "/usage"` to read its session and weekly usage. It also picks up the usage Claude Code caches in `~/.claude.json` whenever it fetches it. Hover over an account to see its usage, along with when each limit resets. Accounts you haven't switched away from yet have no usage.
+- **Auto-Switch:** Settings → Auto-Switch… switches account by itself when one hits its session or weekly limit. Accounts are arranged in fallback groups, one per organization to start with. When an account runs out, SwapBot switches to the member of its group that has used the least. When every member is used up, it moves on to the group you chose as that group's next one. Drag accounts between groups, or out of every group so they never switch. Switching happens without asking and without quitting sessions.
 - **Add Account…** opens Terminal running `claude auth login`. Sign in there and SwapBot asks what to call the new account. You don't need to log out of the current account first. It's saved before the new login replaces it.
 - **Save Current Login…** appears when you're signed in to an account that isn't saved yet, for example after running `/login` in Claude Code.
 - **Manage Accounts:** Log In Again (for an expiring login), Rename, Remove.
@@ -48,6 +49,8 @@ A Claude Code login on macOS is two things: the `claudeAiOauth` object in the Ke
 - `~/.claude/account-profiles/<name>.meta.json` holding the account metadata
 
 Switching replaces only `claudeAiOauth` on the live item, so MCP server tokens (`mcpOAuth`) aren't touched. The account in use is worked out by matching `~/.claude.json` against the saved metadata. Empty tokens are never saved over a good copy, and an empty copy is never restored.
+
+Auto-Switch adds a global `StopFailure` hook to `~/.claude/settings.json` that runs `SwapBot --limit-reached` when a turn stops on a rate limit. It only acts on usage limits ("You've hit your session limit · resets 3:20pm"), not on temporary 429s. It marks that window as full on the account until it resets, then switches. Hook runs within a minute of a switch are ignored, so several sessions hitting the same limit switch only once. Each decision is logged to `~/.claude/account-profiles/auto-switch.log`. Turning Auto-Switch off removes the hook and leaves your other hooks alone.
 
 The Keychain is accessed through `/usr/bin/security` rather than Security.framework. That tool is already on the items' access list, so there are no Keychain prompts, and Claude Code can read everything SwapBot writes.
 

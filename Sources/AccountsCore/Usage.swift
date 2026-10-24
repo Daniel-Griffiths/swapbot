@@ -92,6 +92,81 @@ public struct Usage: Codable, Equatable, Sendable {
     }
 }
 
+extension Usage {
+    func marking(_ limit: UsageLimit, now: Date) -> Usage {
+        let full = UsageWindow(name: limit.window, percent: 100, resetsAt: limit.resetsAt, resetsText: limit.resetsText)
+        var windows = self.windows
+        if let i = windows.firstIndex(where: { $0.name == limit.window }) {
+            windows[i] = full
+        } else if limit.window == "Session" {
+            windows.insert(full, at: 0)
+        } else {
+            windows.append(full)
+        }
+        return Usage(windows: windows, recordedAt: now)
+    }
+
+    public func isExhausted(now: Date = Date()) -> Bool {
+        windows.contains { !$0.hasReset(now: now) && $0.percent >= 100 }
+    }
+
+    public func peakPercent(now: Date = Date()) -> Double {
+        windows.filter { !$0.hasReset(now: now) }.map(\.percent).max() ?? 0
+    }
+}
+
+public struct UsageLimit: Equatable, Sendable {
+    public let window: String
+    public let resetsAt: Date?
+    public let resetsText: String?
+
+    public init?(message: String, now: Date = Date()) {
+        let pattern = #"hit your (.+?) limit(?:\s*·\s*resets\s+(.+?))?\s*$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive, .anchorsMatchLines]),
+              let match = regex.firstMatch(in: message, range: NSRange(message.startIndex..., in: message)),
+              let kindRange = Range(match.range(at: 1), in: message) else { return nil }
+        let kind = message[kindRange].lowercased()
+        let resets = Range(match.range(at: 2), in: message).map { String(message[$0]) }
+        if kind.contains("session") {
+            window = "Session"
+        } else if kind.contains("week") {
+            window = "Week"
+        } else {
+            window = kind.prefix(1).uppercased() + kind.dropFirst()
+        }
+        resetsAt = resets.flatMap { Usage.parseReset($0, now: now) }
+            ?? now.addingTimeInterval(window == "Session" ? 5 * 3600 : 7 * 86_400)
+        resetsText = resets.map(Usage.stripTimeZone)
+    }
+}
+
+public struct CachedUsage: Equatable, Sendable {
+    public let accountUuid: String
+    public let usage: Usage
+
+    static let windows = [("five_hour", "Session"), ("seven_day", "Week"),
+                          ("seven_day_opus", "Week (Opus)"), ("seven_day_sonnet", "Week (Sonnet)")]
+
+    public init?(_ json: Any?) {
+        guard let d = json as? [String: Any], let accountUuid = d["accountUuid"] as? String,
+              let fetched = (d["fetchedAtMs"] as? NSNumber)?.doubleValue,
+              let utilization = d["utilization"] as? [String: Any] else { return nil }
+        let windows = Self.windows.compactMap { key, name -> UsageWindow? in
+            guard let window = utilization[key] as? [String: Any],
+                  let percent = (window["utilization"] as? NSNumber)?.doubleValue else { return nil }
+            return UsageWindow(name: name, percent: percent, resetsAt: (window["resets_at"] as? String).flatMap(Self.date))
+        }
+        guard !windows.isEmpty else { return nil }
+        self.accountUuid = accountUuid
+        usage = Usage(windows: windows, recordedAt: Date(timeIntervalSince1970: (fetched / 1000).rounded(.down)))
+    }
+
+    static func date(_ s: String) -> Date? {
+        let trimmed = s.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression)
+        return ISO8601DateFormatter().date(from: trimmed)
+    }
+}
+
 public enum ClaudeCLI {
     public static func executable() -> String? {
         let home = FileManager.default.homeDirectoryForCurrentUser.path

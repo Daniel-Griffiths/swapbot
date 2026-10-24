@@ -9,6 +9,7 @@ public enum AccountsError: LocalizedError, Equatable {
     case emptySnapshot(String)
     case keychain(String)
     case config(String)
+    case settings(String)
 
     public var errorDescription: String? {
         switch self {
@@ -28,6 +29,8 @@ public enum AccountsError: LocalizedError, Equatable {
             "Keychain error: \(m)"
         case .config(let m):
             "~/.claude.json: \(m)"
+        case .settings(let m):
+            "~/.claude/settings.json: \(m)"
         }
     }
 }
