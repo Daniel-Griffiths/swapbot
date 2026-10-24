@@ -1,15 +1,15 @@
 import Foundation
 
-public struct ShellResult: Sendable {
-    public let status: Int32
-    public let stdout: String
-    public let stderr: String
-    public let timedOut: Bool
+struct ShellResult: Sendable {
+    let status: Int32
+    let stdout: String
+    let stderr: String
+    let timedOut: Bool
 }
 
-public enum Shell {
+enum Shell {
     @discardableResult
-    public static func run(_ executable: String, _ arguments: [String], timeout: TimeInterval = 10,
+    static func run(_ executable: String, _ arguments: [String], timeout: TimeInterval = 10,
                            directory: URL? = nil) -> ShellResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)

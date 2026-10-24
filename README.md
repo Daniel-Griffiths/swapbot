@@ -3,81 +3,81 @@
 </div>
 
 # SwapBot
-Switch Claude Code between Claude accounts from the macOS menu bar.
+Switch Claude Code between Claude accounts from the macOS menu bar, or from the command line on macOS and Linux.
 
-SwapBot keeps several Claude logins (say, work and personal) side by side, all sharing one `~/.claude` config, and swaps between them with one click. Only the login changes. Your settings, MCP servers and history stay put.
+All accounts share one `~/.claude` config. Only the login changes, so your settings, MCP servers and history stay put.
 
 ## Install
 
-Download SwapBot from the [latest release](https://github.com/Daniel-Griffiths/swapbot/releases/latest) and follow the install steps there. It runs on macOS 15 or later, on Apple silicon and Intel.
+Download it from the [latest release](https://github.com/Daniel-Griffiths/swapbot/releases/latest):
 
-Turn on **Settings → Launch at Login** in SwapBot's menu to start it automatically.
+- **macOS 15+:** `SwapBot.dmg`. Turn on **Settings → Launch at Login** to start it automatically.
+- **Linux:** `swapbot-linux-x86_64` or `swapbot-linux-arm64`, a single binary. Run `install -m 755 swapbot-linux-* ~/.local/bin/swapbot`.
 
-### Build from source
-
-Requires the Swift toolchain (Xcode or the Command Line Tools).
+To build from source you need Rust, and Swift for the app:
 
 ```sh
-./scripts/build-app.sh --install   # build, copy to ~/Applications and launch
-./scripts/build-app.sh --dmg       # build a universal build/SwapBot.dmg
+cargo install --path core          # just the swapbot command
+./scripts/build-app.sh --install   # the macOS app, installed to ~/Applications
+./scripts/build-app.sh --dmg       # a universal DMG
 ```
 
-## Usage
-
-Click the robot in the menu bar:
+## Menu bar app
 
 <img src="assets/screenshot.png" width="410" alt="SwapBot menu" />
 
-- **Switch:** click an account, or press its number while the menu is open. The account you're leaving is saved again first, so tokens Claude Code refreshed while it was in use aren't lost.
-- **Usage:** just before switching away from an account, SwapBot runs `claude -p "/usage"` to read its session and weekly usage. It also picks up the usage Claude Code caches in `~/.claude.json` whenever it fetches it. Hover over an account to see its usage, along with when each limit resets. Accounts you haven't switched away from yet have no usage.
-- **Auto-Switch:** Settings → Auto-Switch… switches account by itself when one hits its session or weekly limit. Accounts are arranged in fallback groups, one per organization to start with. When an account runs out, SwapBot switches to the member of its group that has used the least. When every member is used up, it moves on to the group you chose as that group's next one. Drag accounts between groups, or out of every group so they never switch. Switching happens without asking and without quitting sessions. If every account it could switch to is used up, SwapBot waits until the first of them resets and switches then, unless the current account resets sooner. That needs SwapBot running in the menu bar, and it catches up after sleep.
-- **Add Account…** opens Terminal running `claude auth login`. Sign in there and SwapBot asks what to call the new account. You don't need to log out of the current account first. It's saved before the new login replaces it.
-- **Save Current Login…** appears when you're signed in to an account that isn't saved yet, for example after running `/login` in Claude Code.
-- **Manage Accounts:** Log In Again (for an expiring login), Rename, Remove.
-- **Settings:** Launch at Login, whether the account name appears next to the icon, and Stay Awake with Lid Closed. That last one runs `pmset -a disablesleep` and asks for your administrator password. The Mac then doesn't sleep at all, even after SwapBot quits, until you turn it off.
+- **Switch:** click an account, or press its number. The account you're leaving is saved first, so refreshed tokens aren't lost.
+- **Usage:** hover over an account to see its session and weekly usage and when each resets. SwapBot records it with `claude -p /usage` when you switch away, and from the usage Claude Code caches in `~/.claude.json`.
+- **Add Account…** opens Terminal running `claude auth login`, then asks what to call the new account.
+- **Manage Accounts:** Log In Again, Rename, Remove.
+- **Settings:** Auto-Switch, Launch at Login, showing the account name, and Stay Awake with Lid Closed (`pmset -a disablesleep`, which lasts until you turn it off).
 
-The icon shows a `?` badge when the current login isn't saved and an `×` badge when Claude Code is signed out.
+A `?` on the icon means the current login isn't saved, and `×` means Claude Code is signed out.
 
 > [!NOTE]
-> Switching, adding an account or logging in again asks first if Claude Code sessions are running: quit them, continue anyway, or cancel. A session left running carries on under the new account and resends its whole conversation without the old account's cache, which gets expensive for long conversations. Quit sessions' conversations are saved, so `claude --resume` picks them up again. Switching between two accounts in the same team skips this, because a team's accounts share one prompt cache.
+> Before switching, SwapBot offers to quit running Claude Code sessions. A session left running resends its whole conversation without the old account's prompt cache, which is expensive for long conversations. Quit sessions can be picked up again with `claude --resume`. Accounts in the same team share a cache, so switching between them skips this.
 
-## How it works
+## Auto-Switch
 
-A Claude Code login on macOS is two things: the `claudeAiOauth` object in the Keychain item `Claude Code-credentials`, and the `oauthAccount`/`userID` fields in `~/.claude.json`. For each saved account, SwapBot stores:
+When an account hits its session or weekly limit, SwapBot switches to the least-used account in the same fallback group. When the whole group is used up, it moves on to the group you chose as next. If everything is used up, it waits for the first reset. That needs the app running on macOS, or a systemd user timer on Linux.
 
-- a Keychain item `Claude Code-credentials:<name>` holding only `{"claudeAiOauth": …}`
-- `~/.claude/account-profiles/<name>.meta.json` holding the account metadata
-
-Switching replaces only `claudeAiOauth` on the live item, so MCP server tokens (`mcpOAuth`) aren't touched. The account in use is worked out by matching `~/.claude.json` against the saved metadata. Empty tokens are never saved over a good copy, and an empty copy is never restored.
-
-Auto-Switch adds a global `StopFailure` hook to `~/.claude/settings.json` that runs `SwapBot --limit-reached` when a turn stops on a rate limit. It only acts on usage limits ("You've hit your session limit · resets 3:20pm"), not on temporary 429s. It marks that window as full on the account until it resets, then switches. Hook runs within a minute of a switch are ignored, so several sessions hitting the same limit switch only once. Each decision is logged to `~/.claude/account-profiles/auto-switch.log`. Turning Auto-Switch off removes the hook and leaves your other hooks alone.
-
-The Keychain is accessed through `/usr/bin/security` rather than Security.framework. That tool is already on the items' access list, so there are no Keychain prompts, and Claude Code can read everything SwapBot writes.
+Turning it on adds a `StopFailure` hook to `~/.claude/settings.json`. The hook ignores temporary 429s and any limit within a minute of a switch, and logs each decision to `~/.claude/account-profiles/auto-switch.log`.
 
 ## Command line
 
+On macOS the command is `~/Applications/SwapBot.app/Contents/Helpers/swapbot`. Link it onto your `PATH`.
+
 ```sh
-~/Applications/SwapBot.app/Contents/MacOS/SwapBot --list                          # saved accounts and their last recorded usage
-~/Applications/SwapBot.app/Contents/MacOS/SwapBot --switch <name>                 # switch to a saved account
-~/Applications/SwapBot.app/Contents/MacOS/SwapBot --switch <name> --quit-sessions # quit running Claude Code sessions first
+swapbot status                       # accounts, plans, login expiry and usage
+swapbot save <name>                  # save the current login
+swapbot login [<name>]               # claude auth login, then save it
+swapbot switch <name>                # --quit-sessions or --ignore-sessions if any are running
+swapbot rename <name> <new-name>
+swapbot remove <name>
+swapbot auto-switch [on|off]         # show groups, or add or remove the hook
+swapbot group move work none         # never switch away from "work"
+swapbot group next Work Personal     # fall back from Work to Personal
 ```
 
-`--switch` works like clicking an account: it records the outgoing account's usage, then swaps the login. It refuses while Claude Code sessions are running unless you pass `--quit-sessions`, except when both accounts are in the same team.
+`list`, `status` and `auto-switch` take `--json`.
+
+## How it works
+
+A login is the `claudeAiOauth` object in Claude Code's credentials plus `oauthAccount`/`userID` in `~/.claude.json`. The credentials are in the Keychain item `Claude Code-credentials` on macOS, or `~/.claude/.credentials.json` on Linux. Each saved account keeps a copy of both:
+- its tokens in `Claude Code-credentials:<name>` on macOS, or `~/.claude/account-profiles/<name>.credentials.json` on Linux
+- its metadata in `<name>.meta.json`
+
+Switching replaces only `claudeAiOauth`, so MCP tokens aren't touched, and empty tokens are never saved or restored. The Keychain is read through `/usr/bin/security`, which is already on the items' access list, so there are no prompts.
+
+The core and CLI are Rust (`core/`). The macOS app is Swift (`Sources/SwapBot`) and does everything through the bundled `swapbot`.
 
 ## Development
 
 ```sh
-swift test   # uses a throwaway Keychain service, never your live login
+cargo test --manifest-path core/Cargo.toml
 ```
 
-The binary has a few read-only debugging modes:
-
-```sh
-~/Applications/SwapBot.app/Contents/MacOS/SwapBot --dump        # accounts and token expiry
-~/Applications/SwapBot.app/Contents/MacOS/SwapBot --dump-menu   # the menu as text
-```
-
-Set `SWAPBOT_SERVICE`, `SWAPBOT_PROFILE_DIR` and `SWAPBOT_CLAUDE_JSON` to point the app at test data. To regenerate the icon after changing `RobotIcon.swift`:
+`SWAPBOT_PROFILE_DIR`, `SWAPBOT_CLAUDE_JSON`, `SWAPBOT_CLAUDE_SETTINGS` and `SWAPBOT_CREDENTIALS_FILE` point SwapBot at test data. `SWAPBOT_CREDENTIALS=file` uses credential files on macOS, `SWAPBOT_CLAUDE` swaps `claude`, and `SWAPBOT_CLI` swaps the app's `swapbot`. `SwapBot --dump-menu` prints the menu as text. To regenerate the icon:
 
 ```sh
 .build/debug/SwapBot --render-app-icon /tmp/AppIcon.iconset

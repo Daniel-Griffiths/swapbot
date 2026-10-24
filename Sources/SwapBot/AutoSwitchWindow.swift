@@ -1,13 +1,12 @@
 import AppKit
-import AccountsCore
 import SwiftUI
 
 @MainActor
 enum AutoSwitchWindow {
     private static var window: NSWindow?
 
-    static func show(store: ProfileStore) {
-        let controller = NSHostingController(rootView: AutoSwitchView(model: AutoSwitchModel(store: store)))
+    static func show() {
+        let controller = NSHostingController(rootView: AutoSwitchView(model: AutoSwitchModel()))
         controller.sizingOptions = .preferredContentSize
         if let window {
             window.contentViewController = controller
@@ -23,13 +22,6 @@ enum AutoSwitchWindow {
         window?.makeKeyAndOrderFront(nil)
         DispatchQueue.main.async { window?.makeFirstResponder(nil) }
     }
-
-    static func refreshHookPath(store: ProfileStore) {
-        let hooks = ClaudeHooks(settingsURL: store.paths.claudeSettings)
-        guard let executable = Bundle.main.executablePath, let installed = hooks.installedCommand(),
-              installed != ClaudeHooks.command(executable: executable) else { return }
-        try? hooks.install(executable: executable)
-    }
 }
 
 @MainActor
@@ -42,23 +34,27 @@ final class AutoSwitchModel {
         let organizationID: String
     }
 
-    let accounts: [Account]
-    private(set) var settings: AutoSwitchSettings
-    private(set) var enabled: Bool
-    private let autoSwitch: AutoSwitch
-    private let hooks: ClaudeHooks
+    private(set) var accounts: [Account] = []
+    private(set) var settings = AutoSwitchSettings(groups: [])
+    private(set) var enabled = false
 
-    init(store: ProfileStore) {
-        autoSwitch = AutoSwitch(store: store)
-        hooks = ClaudeHooks(settingsURL: store.paths.claudeSettings)
-        accounts = store.profiles(includeTokens: false).map { profile in
-            Account(name: profile.name,
-                    organization: profile.account?.organizationLabel ?? profile.account?.email ?? profile.name,
-                    organizationID: profile.account?.organizationUuid ?? profile.name)
+    init() {
+        reload()
+    }
+
+    private func reload() {
+        do {
+            let status = try CLI.decode(AutoSwitchStatus.self, ["auto-switch", "--json"])
+            settings = status.settings
+            enabled = status.enabled
+            accounts = status.accounts.map { profile in
+                Account(name: profile.name,
+                        organization: profile.account?.organizationLabel ?? profile.account?.email ?? profile.name,
+                        organizationID: profile.account?.organizationUuid ?? profile.name)
+            }
+        } catch {
+            Prompts.error(error, title: "Couldn't read the Auto-Switch settings")
         }
-        settings = autoSwitch.settings()
-        enabled = hooks.installedCommand() != nil
-        if !autoSwitch.hasSettings() { try? autoSwitch.save(settings) }
     }
 
     var orderedGroups: [FallbackGroup] {
@@ -95,51 +91,36 @@ final class AutoSwitchModel {
     }
 
     func setEnabled(_ on: Bool) {
-        do {
-            if on, let executable = Bundle.main.executablePath {
-                try hooks.install(executable: executable)
-            } else if !on {
-                try hooks.uninstall()
-            }
-        } catch {
-            Prompts.error(error, title: "Couldn't change the Claude Code hook")
-        }
-        enabled = hooks.installedCommand() != nil
+        change(["auto-switch", on ? "on" : "off"], failure: "Couldn't change the Claude Code hook")
     }
 
     func move(_ name: String, to group: UUID?) {
-        change { $0.move(name, to: group) }
+        change(["group", "move", "--", name, group?.uuidString ?? "none"])
     }
 
     func rename(_ group: UUID, to name: String) {
-        change { settings in
-            if let i = settings.groups.firstIndex(where: { $0.id == group }) { settings.groups[i].name = name }
-        }
+        change(["group", "rename", "--", group.uuidString, name])
     }
 
     func setNext(_ next: UUID?, for group: UUID) {
-        change { settings in
-            if let i = settings.groups.firstIndex(where: { $0.id == group }) { settings.groups[i].next = next }
-        }
+        change(["group", "next", "--", group.uuidString, next?.uuidString ?? "none"])
     }
 
     func addGroup() {
-        change { $0.groups.append(FallbackGroup(name: "New Group")) }
+        change(["group", "add", "--", "New Group"])
     }
 
     func removeGroup(_ group: UUID) {
-        change { $0.remove(group: group) }
+        change(["group", "remove", "--", group.uuidString])
     }
 
-    private func change(_ body: (inout AutoSwitchSettings) -> Void) {
-        var updated = settings
-        body(&updated)
+    private func change(_ arguments: [String], failure: String = "Couldn't save the Auto-Switch settings") {
         do {
-            try autoSwitch.save(updated)
-            settings = updated
+            try CLI.run(arguments)
         } catch {
-            Prompts.error(error, title: "Couldn't save the Auto-Switch settings")
+            Prompts.error(error, title: failure)
         }
+        reload()
     }
 }
 

@@ -1,0 +1,22 @@
+[package]
+name = "swapbot"
+version = "1.0.0"
+edition = "2021"
+description = "Switch Claude Code between saved Claude accounts"
+publish = false
+rust-version = "1.85"
+resolver = "3"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = { version = "0.10", default-features = false }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+lto = true
+strip = true

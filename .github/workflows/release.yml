@@ -13,25 +13,68 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  linux:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: swapbot-linux-x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: swapbot-linux-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Test
+        run: cargo test --manifest-path core/Cargo.toml
+
+      - name: Build
+        run: |
+          cargo build --release --manifest-path core/Cargo.toml --target ${{ matrix.target }}
+          cp core/target/${{ matrix.target }}/release/swapbot ${{ matrix.asset }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
   release:
+    needs: linux
     runs-on: macos-latest
     env:
       VERSION: 1.0.0
     steps:
       - uses: actions/checkout@v4
 
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
       - name: Test
-        run: swift test
+        run: cargo test --manifest-path core/Cargo.toml
 
       - name: Build DMG
-        run: ./scripts/build-app.sh --dmg
+        run: |
+          ./scripts/build-app.sh --dmg
+          cp build/swapbot build/swapbot-macos
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: build/linux
+          merge-multiple: true
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete "v$VERSION" --cleanup-tag --yes || true
-          gh release create "v$VERSION" build/SwapBot.dmg \
+          gh release create "v$VERSION" build/SwapBot.dmg build/swapbot-macos build/linux/swapbot-linux-* \
             --title "SwapBot $VERSION" \
             --notes-file .github/release-notes.md \
             --target "$GITHUB_SHA" \

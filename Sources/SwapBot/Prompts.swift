@@ -1,5 +1,4 @@
 import AppKit
-import AccountsCore
 
 @MainActor
 enum Prompts {
@@ -65,10 +64,8 @@ enum Prompts {
             guard run(alert) == .alertFirstButtonReturn else { return nil }
 
             value = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            do {
-                try ProfileStore.validate(value)
-            } catch {
-                problem = error.localizedDescription
+            if value.range(of: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$"#, options: .regularExpression) == nil {
+                problem = "“\(value)” isn't a valid name. Use letters, numbers, dots, dashes or underscores."
                 continue
             }
             if let issue = check(value) {

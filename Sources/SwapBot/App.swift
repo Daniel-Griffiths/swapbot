@@ -1,5 +1,4 @@
 import AppKit
-import AccountsCore
 import ServiceManagement
 
 @main
@@ -22,21 +21,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             print("launch at login: \(SMAppService.mainApp.status == .enabled ? "on" : "off")")
             return
         }
-        if CommandLine.arguments.contains("--dump") {
-            dump(ProfileStore())
-            return
-        }
-        if CommandLine.arguments.contains(ClaudeHooks.flag) {
-            limitReached(ProfileStore())
-            return
-        }
-        if CommandLine.arguments.contains("--list") {
-            list(ProfileStore())
-            return
-        }
-        if let i = CommandLine.arguments.firstIndex(of: "--switch"), i + 1 < CommandLine.arguments.count {
-            exit(switchAccount(ProfileStore(), to: CommandLine.arguments[i + 1],
-                               quitSessions: CommandLine.arguments.contains("--quit-sessions")))
+        if CommandLine.arguments.contains("--limit-reached") {
+            exit(CLI.forward(["limit-reached"]))
         }
         if let i = CommandLine.arguments.firstIndex(of: "--render-app-icon"), i + 1 < CommandLine.arguments.count {
             RobotIcon.writeAppIconset(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
@@ -61,7 +47,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         app.run()
     }
 
-    private let store = ProfileStore()
     var statusItem: NSStatusItem!
     private var loginTimer: Timer?
     private var retryTimer: Timer?
@@ -70,7 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var sleepDisabled = Power.sleepDisabled
 
     private struct PendingLogin {
-        let before: LoginFingerprint
+        let before: String
         let relogin: String?
         let started: Date
     }
@@ -85,34 +70,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
-        updateLabel()
-        store.importCachedUsage()
-        AutoSwitchWindow.refreshHookPath(store: store)
+        refresh()
+        _ = try? CLI.run(["auto-switch", "refresh-hook"])
 
         DistributedNotificationCenter.default().addObserver(forName: Self.changed, object: nil, queue: .main) { _ in
-            MainActor.assumeIsolated {
-                AppDelegate.shared?.updateLabel()
-                AppDelegate.shared?.scheduleRetry()
-            }
+            MainActor.assumeIsolated { AppDelegate.shared?.refresh() }
         }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in
-            MainActor.assumeIsolated { AppDelegate.shared?.scheduleRetry() }
+            MainActor.assumeIsolated { AppDelegate.shared?.refresh() }
         }
-        scheduleRetry()
         if let i = CommandLine.arguments.firstIndex(of: "--screenshot"), i + 1 < CommandLine.arguments.count {
             captureMenu(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
         }
     }
 
-    func menuWillOpen(_ menu: NSMenu) {
-        store.importCachedUsage()
-        updateLabel()
+    private func refresh() {
+        let status = CLI.status()
+        updateLabel(status)
+        scheduleRetry(status?.pendingRetry)
     }
 
-    private func scheduleRetry() {
+    private func scheduleRetry(_ date: Date?) {
         retryTimer?.invalidate()
         retryTimer = nil
-        guard let date = AutoSwitch(store: store).pendingRetry() else { return }
+        guard let date else { return }
         let timer = Timer(fire: max(date, Date()), interval: 0, repeats: false) { _ in
             MainActor.assumeIsolated { AppDelegate.shared?.retryAutoSwitch() }
         }
@@ -121,10 +102,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func retryAutoSwitch() {
-        let autoSwitch = AutoSwitch(store: store)
-        autoSwitch.log(autoSwitch.retry())
-        updateLabel()
-        scheduleRetry()
+        _ = try? CLI.run(["auto-switch", "retry"])
+        refresh()
     }
 
     private func waitForLogin(_ pending: PendingLogin) {
@@ -139,7 +118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let pending = pendingLogin else { return stopWaitingForLogin() }
         if Date().timeIntervalSince(pending.started) > 15 * 60 {
             stopWaitingForLogin()
-        } else if store.fingerprint() != pending.before {
+        } else if let fingerprint = try? CLI.run(["fingerprint"]), fingerprint != pending.before {
             stopWaitingForLogin()
             loginFinished(pending)
         }
@@ -151,18 +130,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loginTimer = nil
     }
 
-    private func updateLabel() {
+    private func updateLabel(_ status: Status?) {
         guard let button = statusItem?.button else { return }
-        let current = store.currentAccount()
-        let active = store.activeProfile()
+        let current = status?.current
         let badge: RobotIcon.Badge?
         let title: String
         if current == nil {
             badge = .xmark
-            title = "signed out"
-        } else if let active {
+            title = status == nil ? "unavailable" : "signed out"
+        } else if let active = status?.active {
             badge = nil
-            title = active.name
+            title = active
         } else {
             badge = .questionmark
             title = current?.email?.components(separatedBy: "@").first ?? "unsaved"
@@ -175,13 +153,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        let (profiles, liveTokens) = store.profilesAndLiveTokens()
-        let current = store.currentAccount()
-        let active = store.activeProfile(in: profiles)
+        let status = CLI.status(tokens: true)
+        updateLabel(status)
+        scheduleRetry(status?.pendingRetry)
+        guard let status else {
+            menu.addItem(disabled("SwapBot couldn't read your accounts"))
+            menu.addItem(.separator())
+            menu.addItem(NSMenuItem(title: "Quit SwapBot", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+            return
+        }
+        let profiles = status.accounts
+        let current = status.current
 
         let header: String
         if let current {
-            header = "Signed in as \(current.email ?? "unknown")" + (active == nil ? " (not saved)" : "")
+            header = "Signed in as \(current.email ?? "unknown")" + (status.active == nil ? " (not saved)" : "")
         } else {
             header = "Claude Code is signed out"
         }
@@ -192,19 +178,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(disabled("No saved accounts"))
         }
         for (index, profile) in profiles.enumerated() {
-            let isActive = profile.name == active?.name
+            let isActive = profile.name == status.active
             let item = NSMenuItem(title: profile.name, action: #selector(switchAccount(_:)),
                                   keyEquivalent: index < 9 ? "\(index + 1)" : "")
             item.target = self
             item.representedObject = profile.name
             item.state = isActive ? .on : .off
-            item.attributedTitle = accountTitle(profile, tokens: isActive ? liveTokens : profile.tokens)
+            item.attributedTitle = accountTitle(profile, tokens: isActive ? status.liveTokens : profile.tokens)
             item.toolTip = usageTooltip(profile.usage, isActive: isActive)
             menu.addItem(item)
         }
         menu.addItem(.separator())
 
-        if current != nil && active == nil {
+        if current != nil && status.active == nil {
             menu.addItem(action("Save Current Login…", #selector(saveCurrent)))
         }
         menu.addItem(action("Add Account…", #selector(addAccount)))
@@ -314,10 +300,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func switchAccount(_ sender: NSMenuItem) {
-        guard !isBusy, let name = sender.representedObject as? String else { return }
-        guard store.activeProfile()?.name != name else { return }
-        let profile = store.profiles().first { $0.name == name }
-        guard let tokens = profile?.tokens, tokens.hasTokens, !tokens.isRefreshExpired() else {
+        guard !isBusy, let name = sender.representedObject as? String, let status = CLI.status(tokens: true),
+              status.active != name else { return }
+        let profile = status.profile(name)
+        guard let tokens = profile?.tokens, tokens.isUsable else {
             if Prompts.confirm("The saved login for “\(name)” has expired",
                                "Log in as \(profile?.account?.email ?? name) again to keep using it.",
                                confirm: "Log In Again…") {
@@ -325,48 +311,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             return
         }
-        let sameTeam = store.currentAccount().flatMap { current in profile?.account?.sharesPromptCache(with: current) } ?? false
+        let sameTeam = status.current.flatMap { current in profile?.account?.sharesPromptCache(with: current) } ?? false
         guard sameTeam || quitSessions(before: "switching to “\(name)”") else { return }
-        recordOutgoingUsage { [self] in
-            do {
-                try store.use(name)
-            } catch {
-                Prompts.error(error, title: "Couldn't switch to “\(name)”")
-            }
-            updateLabel()
-        }
+        runBusy(["switch", name, "--ignore-sessions"], failure: "Couldn't switch to “\(name)”")
     }
 
-    private func recordOutgoingUsage(then next: @escaping @MainActor () -> Void) {
-        guard let outgoing = store.activeProfile()?.name else {
-            next()
-            return
-        }
+    private func runBusy(_ arguments: [String], failure title: String, then next: @escaping @MainActor () -> Void = {}) {
         isBusy = true
         statusItem.button?.appearsDisabled = true
         Task { @MainActor in
-            let usage = await Task.detached { ClaudeCLI.usage() }.value
-            if let usage { store.recordUsage(for: outgoing) { usage } }
+            let result = await Task.detached { Result { try CLI.run(arguments, timeout: 120) } }.value
             isBusy = false
             statusItem.button?.appearsDisabled = false
-            next()
+            refresh()
+            switch result {
+            case .success: next()
+            case .failure(let error): Prompts.error(error, title: title)
+            }
         }
     }
 
     @objc private func saveCurrent() {
-        let suggestion = suggestedName(for: store.currentAccount())
-        guard let name = Prompts.name(
+        guard let status = CLI.status(), let name = Prompts.name(
             "Save Current Login",
-            "Name the account signed in as \(store.currentAccount()?.email ?? "unknown").",
-            initial: suggestion, confirm: "Save",
-            check: { store.exists($0) ? "There's already an account called “\($0)”." : nil }
+            "Name the account signed in as \(status.current?.email ?? "unknown").",
+            initial: status.suggestedName ?? "account", confirm: "Save",
+            check: { status.exists($0) ? "There's already an account called “\($0)”." : nil }
         ) else { return }
         do {
-            try store.save(as: name)
+            try CLI.run(["save", name])
         } catch {
             Prompts.error(error, title: "Couldn't save the login")
         }
-        updateLabel()
+        refresh()
     }
 
     @objc private func addAccount() {
@@ -379,31 +356,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func renameAccount(_ sender: NSMenuItem) {
-        guard !isBusy, let name = sender.representedObject as? String,
+        guard !isBusy, let name = sender.representedObject as? String, let status = CLI.status(),
               let newName = Prompts.name(
                 "Rename “\(name)”", "Choose a new name.", initial: name, confirm: "Rename",
-                check: { $0 != name && store.exists($0) ? "There's already an account called “\($0)”." : nil }
+                check: { $0 != name && status.exists($0) ? "There's already an account called “\($0)”." : nil }
               ) else { return }
         do {
-            try store.rename(name, to: newName)
+            try CLI.run(["rename", name, newName])
         } catch {
             Prompts.error(error, title: "Couldn't rename “\(name)”")
         }
-        updateLabel()
+        refresh()
     }
 
     @objc private func removeAccount(_ sender: NSMenuItem) {
         guard !isBusy, let name = sender.representedObject as? String else { return }
-        let isActive = store.activeProfile()?.name == name
+        let isActive = CLI.status()?.active == name
         let detail = "This deletes its saved login from the Keychain."
             + (isActive ? " It's the account in use now: Claude Code stays signed in to it, but you can't switch back to it later." : "")
         guard Prompts.confirm("Remove “\(name)”?", detail, confirm: "Remove", destructive: true) else { return }
         do {
-            try store.remove(name)
+            try CLI.run(["remove", name])
         } catch {
             Prompts.error(error, title: "Couldn't remove “\(name)”")
         }
-        updateLabel()
+        refresh()
     }
 
     @objc private func toggleLaunchAtLogin() {
@@ -428,29 +405,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func showAutoSwitch() {
-        AutoSwitchWindow.show(store: store)
+        AutoSwitchWindow.show()
     }
 
     @objc private func toggleShowName() {
         showsName.toggle()
-        updateLabel()
+        refresh()
     }
 
     private func startLogin(relogin: String?) {
         guard !isBusy, quitSessions(before: relogin == nil ? "adding an account" : "logging in again") else { return }
-        recordOutgoingUsage { [self] in openLogin(relogin: relogin) }
+        runBusy(["record-usage"], failure: "Couldn't record usage") { [self] in openLogin(relogin: relogin) }
     }
 
     private func openLogin(relogin: String?) {
-        let email = relogin.flatMap { name in store.profiles(includeTokens: false).first { $0.name == name }?.account?.email }
+        let status = CLI.status()
+        let email = relogin.flatMap { status?.profile($0)?.account?.email }
         var command = "claude auth login"
         if let email { command += " --email \(Sessions.shellQuote(email))" }
 
-        if let active = store.activeProfile() {
-            try? store.save(as: active.name, replacing: true)
+        if let active = status?.active {
+            _ = try? CLI.run(["save", active, "--replace"])
         }
-        let before = store.fingerprint()
         do {
+            let before = try CLI.run(["fingerprint"])
             try Sessions.openInTerminal(name: "login", """
             \(command)
             echo
@@ -463,41 +441,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func loginFinished(_ pending: PendingLogin) {
-        updateLabel()
-        guard let current = store.currentAccount() else { return }
+        refresh()
+        guard let status = CLI.status(), let current = status.current else { return }
         let email = current.email ?? "unknown"
 
-        if let match = store.profiles(includeTokens: false).first(where: { $0.account?.sameLogin(as: current) == true }) {
+        if let match = status.active {
             do {
-                try store.save(as: match.name, replacing: true)
+                try CLI.run(["save", match, "--replace"])
                 var detail = "Signed in as \(email). Its saved login is up to date."
-                if let wanted = pending.relogin, wanted != match.name {
-                    detail = "You signed in as \(email), which is saved as “\(match.name)”, not “\(wanted)”. Updated “\(match.name)”."
+                if let wanted = pending.relogin, wanted != match {
+                    detail = "You signed in as \(email), which is saved as “\(match)”, not “\(wanted)”. Updated “\(match)”."
                 }
-                Prompts.info("“\(match.name)” is ready", detail)
+                Prompts.info("“\(match)” is ready", detail)
             } catch {
                 Prompts.error(error, title: "Couldn't save the new login")
             }
-            updateLabel()
+            refresh()
             return
         }
 
         guard let name = Prompts.name(
             "New Login: \(email)",
             "Name this account" + (current.organizationName.map { " (\($0))" } ?? "") + ".",
-            initial: suggestedName(for: current), confirm: "Save",
-            check: { store.exists($0) ? "There's already an account called “\($0)”." : nil }
+            initial: status.suggestedName ?? "account", confirm: "Save",
+            check: { status.exists($0) ? "There's already an account called “\($0)”." : nil }
         ) else { return }
         do {
-            try store.save(as: name)
+            try CLI.run(["save", name])
         } catch {
             Prompts.error(error, title: "Couldn't save the new login")
         }
-        updateLabel()
+        refresh()
     }
 
     private func quitSessions(before what: String) -> Bool {
-        let pids = Sessions.runningClaudeSessions()
+        let pids = (try? CLI.decode([Int32].self, ["sessions", "--json"])) ?? []
         guard !pids.isEmpty else { return true }
         let sessions = pids.count == 1 ? "1 Claude Code session" : "\(pids.count) Claude Code sessions"
         switch Prompts.choose(
@@ -516,24 +494,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             )
         case .confirm: break
         }
-        let survivors = Processes.terminate(pids)
-        if !survivors.isEmpty {
-            Prompts.info("Couldn't quit every session", "\(survivors.count) Claude Code process\(survivors.count == 1 ? "" : "es") (PID \(survivors.map(String.init).joined(separator: ", "))) is still running, so nothing was changed.")
+        do {
+            try CLI.run(["quit-sessions"], timeout: 30)
+        } catch {
+            Prompts.info("Couldn't quit every session", error.localizedDescription)
             return false
         }
         return true
-    }
-
-    private func suggestedName(for account: AccountInfo?) -> String {
-        let base = account?.email?.components(separatedBy: "@").first ?? "account"
-        let cleaned = base.replacingOccurrences(of: #"[^A-Za-z0-9._-]"#, with: "-", options: .regularExpression)
-        var name = cleaned.isEmpty ? "account" : String(cleaned.prefix(40))
-        var n = 2
-        while store.exists(name) {
-            name = "\(cleaned.prefix(36))-\(n)"
-            n += 1
-        }
-        return name
     }
 
     private static func renderIcons(to dir: URL) {
@@ -566,83 +533,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let tip = item.toolTip { print(pad + "    [tooltip] " + tip.replacingOccurrences(of: "\n", with: " | ")) }
             if let sub = item.submenu { printMenu(sub, depth: depth + 1) }
         }
-    }
-
-    private static func list(_ store: ProfileStore) {
-        let profiles = store.profiles(includeTokens: false)
-        let active = store.activeProfile(in: profiles)
-        for p in profiles {
-            let usage = p.usage.map { usage in
-                usage.windows.map { window in
-                    window.hasReset() ? "\(window.name) has reset" : "\(window.name) \(Int(window.percent.rounded()))%"
-                }.joined(separator: ", ")
-            } ?? "no usage recorded"
-            print("\(p.name == active?.name ? "*" : " ") \(p.name)  \(p.account?.email ?? "?")  \(usage)")
-        }
-    }
-
-    private static func switchAccount(_ store: ProfileStore, to name: String, quitSessions: Bool) -> Int32 {
-        guard let profile = store.profiles().first(where: { $0.name == name }) else {
-            print("no saved account named “\(name)”")
-            return 1
-        }
-        let outgoing = store.activeProfile()?.name
-        if outgoing == name {
-            print("already using “\(name)”")
-            return 0
-        }
-        guard let tokens = profile.tokens, tokens.hasTokens, !tokens.isRefreshExpired() else {
-            print("the saved login for “\(name)” has expired; use Log In Again from the menu")
-            return 1
-        }
-        let sameTeam = store.currentAccount().flatMap { profile.account?.sharesPromptCache(with: $0) } ?? false
-        let pids = sameTeam ? [] : Sessions.runningClaudeSessions()
-        if !pids.isEmpty {
-            guard quitSessions else {
-                print("\(pids.count) Claude Code session\(pids.count == 1 ? " is" : "s are") running; pass --quit-sessions to quit \(pids.count == 1 ? "it" : "them") first")
-                return 1
-            }
-            let survivors = Processes.terminate(pids)
-            guard survivors.isEmpty else {
-                print("couldn't quit PID \(survivors.map(String.init).joined(separator: ", ")), so nothing was changed")
-                return 1
-            }
-        }
-        if let outgoing { store.recordUsage(for: outgoing) }
-        do {
-            try store.use(name)
-        } catch {
-            print("couldn't switch to “\(name)”: \(error.localizedDescription)")
-            return 1
-        }
-        postChanged()
-        print("switched to “\(name)” (\(profile.account?.email ?? "unknown account"))")
-        return 0
-    }
-
-    private static func limitReached(_ store: ProfileStore) {
-        let input = FileHandle.standardInput.readDataToEndOfFile()
-        let event = (try? JSONSerialization.jsonObject(with: input)) as? [String: Any]
-        store.importCachedUsage()
-        let autoSwitch = AutoSwitch(store: store)
-        let outcome = autoSwitch.handleLimit(message: event?["last_assistant_message"] as? String ?? "")
-        autoSwitch.log(outcome)
-        if case .ignored = outcome { return }
-        postChanged()
-    }
-
-    private static func postChanged() {
-        DistributedNotificationCenter.default().postNotificationName(changed, object: nil, userInfo: nil, deliverImmediately: true)
-    }
-
-    private static func dump(_ store: ProfileStore) {
-        let profiles = store.profiles()
-        let active = store.activeProfile(in: profiles)
-        print("current: \(store.currentAccount()?.email ?? "signed out")")
-        for p in profiles {
-            let t = p.tokens
-            print("\(p.name == active?.name ? "*" : " ") \(p.name)  \(p.account?.email ?? "?")  plan=\(t?.subscriptionType ?? "?") tokens=\(t?.hasTokens ?? false) refreshExpires=\(t?.refreshExpires.map { "\($0)" } ?? "?") usage=\(p.usage.map { $0.windows.map { "\($0.name) \($0.percent)%" }.joined(separator: ", ") } ?? "none")")
-        }
-        print("running sessions: \(Sessions.runningClaudeSessions().count)")
     }
 }

@@ -1,13 +1,6 @@
 import Foundation
-import AccountsCore
 
 enum Sessions {
-    static func runningClaudeSessions() -> [Int32] {
-        Shell.run("/usr/bin/pgrep", ["-x", "claude"]).stdout
-            .split(separator: "\n")
-            .compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
-    }
-
     static func openInTerminal(name: String, _ body: String) throws {
         let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("SwapBot", isDirectory: true)
