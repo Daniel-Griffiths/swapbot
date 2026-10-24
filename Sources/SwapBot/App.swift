@@ -6,7 +6,7 @@ import ServiceManagement
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static var shared: AppDelegate?
-    private static let accountChanged = Notification.Name("com.danielgriffiths.SwapBot.accountChanged")
+    private static let changed = Notification.Name("com.danielgriffiths.SwapBot.changed")
 
     static func main() {
         if let i = CommandLine.arguments.firstIndex(of: "--launch-at-login"), i + 1 < CommandLine.arguments.count {
@@ -64,6 +64,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let store = ProfileStore()
     var statusItem: NSStatusItem!
     private var loginTimer: Timer?
+    private var retryTimer: Timer?
     private var pendingLogin: PendingLogin?
     private var isBusy = false
     private var sleepDisabled = Power.sleepDisabled
@@ -88,9 +89,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         store.importCachedUsage()
         AutoSwitchWindow.refreshHookPath(store: store)
 
-        DistributedNotificationCenter.default().addObserver(forName: Self.accountChanged, object: nil, queue: .main) { _ in
-            MainActor.assumeIsolated { AppDelegate.shared?.updateLabel() }
+        DistributedNotificationCenter.default().addObserver(forName: Self.changed, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated {
+                AppDelegate.shared?.updateLabel()
+                AppDelegate.shared?.scheduleRetry()
+            }
         }
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { AppDelegate.shared?.scheduleRetry() }
+        }
+        scheduleRetry()
         if let i = CommandLine.arguments.firstIndex(of: "--screenshot"), i + 1 < CommandLine.arguments.count {
             captureMenu(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
         }
@@ -99,6 +107,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         store.importCachedUsage()
         updateLabel()
+    }
+
+    private func scheduleRetry() {
+        retryTimer?.invalidate()
+        retryTimer = nil
+        guard let date = AutoSwitch(store: store).pendingRetry() else { return }
+        let timer = Timer(fire: max(date, Date()), interval: 0, repeats: false) { _ in
+            MainActor.assumeIsolated { AppDelegate.shared?.retryAutoSwitch() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        retryTimer = timer
+    }
+
+    private func retryAutoSwitch() {
+        let autoSwitch = AutoSwitch(store: store)
+        autoSwitch.log(autoSwitch.retry())
+        updateLabel()
+        scheduleRetry()
     }
 
     private func waitForLogin(_ pending: PendingLogin) {
@@ -589,7 +615,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             print("couldn't switch to “\(name)”: \(error.localizedDescription)")
             return 1
         }
-        postAccountChanged()
+        postChanged()
         print("switched to “\(name)” (\(profile.account?.email ?? "unknown account"))")
         return 0
     }
@@ -601,11 +627,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let autoSwitch = AutoSwitch(store: store)
         let outcome = autoSwitch.handleLimit(message: event?["last_assistant_message"] as? String ?? "")
         autoSwitch.log(outcome)
-        if case .switched = outcome { postAccountChanged() }
+        if case .ignored = outcome { return }
+        postChanged()
     }
 
-    private static func postAccountChanged() {
-        DistributedNotificationCenter.default().postNotificationName(accountChanged, object: nil, userInfo: nil, deliverImmediately: true)
+    private static func postChanged() {
+        DistributedNotificationCenter.default().postNotificationName(changed, object: nil, userInfo: nil, deliverImmediately: true)
     }
 
     private static func dump(_ store: ProfileStore) {

@@ -110,6 +110,13 @@ extension Usage {
         windows.contains { !$0.hasReset(now: now) && $0.percent >= 100 }
     }
 
+    public func availableAt(now: Date = Date()) -> Date? {
+        let full = windows.filter { !$0.hasReset(now: now) && $0.percent >= 100 }
+        if full.isEmpty { return now }
+        let resets = full.compactMap(\.resetsAt)
+        return resets.count == full.count ? resets.max() : nil
+    }
+
     public func peakPercent(now: Date = Date()) -> Double {
         windows.filter { !$0.hasReset(now: now) }.map(\.percent).max() ?? 0
     }

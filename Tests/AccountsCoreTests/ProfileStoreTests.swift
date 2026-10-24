@@ -282,7 +282,7 @@ extension ProfileStoreTests {
     @Test func usageLimitMovesToTheNextGroupOnlyWhenTheGroupIsUsedUp() throws {
         try saveAccounts()
         let autoSwitch = AutoSwitch(store: store)
-        let now = Date()
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-10-17T11:15:00Z"))
         try autoSwitch.save(AutoSwitchSettings(groups: [FallbackGroup(name: "Home", members: ["personal"])]))
         #expect(autoSwitch.handleLimit(message: "You've hit your session limit · resets 3:20pm", now: now)
             == .ignored("“work” hit its session limit; it isn't in a fallback group"))
@@ -291,7 +291,7 @@ extension ProfileStoreTests {
         try autoSwitch.save(AutoSwitchSettings(groups: [FallbackGroup(name: "Work", members: ["work", "work2"]), home]))
         store.recordUsage(for: "work2") { Usage(windows: [UsageWindow(name: "Week", percent: 100, resetsAt: now.addingTimeInterval(3600))]) }
         #expect(autoSwitch.handleLimit(message: "You've hit your weekly limit · resets Oct 25 at 6pm", now: now)
-            == .ignored("“work” hit its week limit; no account in its fallback groups has usage left"))
+            == .waiting("“work” hit its week limit and everything it can switch to is used up", until: now.addingTimeInterval(3600)))
 
         try autoSwitch.save(AutoSwitchSettings(groups: [FallbackGroup(name: "Work", members: ["work", "work2"], next: home.id), home]))
         #expect(autoSwitch.handleLimit(message: "You've hit your weekly limit", now: now) == .switched(from: "work", to: "personal"))
@@ -415,5 +415,55 @@ extension ProfileStoreTests {
         let hooks = ClaudeHooks(settingsURL: store.paths.claudeSettings)
         #expect(throws: AccountsError.self) { try hooks.install(executable: "/Applications/SwapBot.app/Contents/MacOS/SwapBot") }
         #expect(try String(contentsOf: store.paths.claudeSettings, encoding: .utf8) == "{ not json")
+    }
+}
+
+extension ProfileStoreTests {
+    func exhaust(_ name: String, until date: Date) {
+        store.recordUsage(for: name) { Usage(windows: [UsageWindow(name: "Session", percent: 100, resetsAt: date)]) }
+    }
+
+    @Test func waitsForTheEarliestResetInTheChainThenSwitches() throws {
+        try saveAccounts()
+        let autoSwitch = AutoSwitch(store: store)
+        let home = FallbackGroup(name: "Home", members: ["personal"])
+        try autoSwitch.save(AutoSwitchSettings(groups: [FallbackGroup(name: "Work", members: ["work", "work2"], next: home.id), home]))
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-10-17T11:15:00Z"))
+        exhaust("work2", until: now.addingTimeInterval(2 * 3600))
+        exhaust("personal", until: now.addingTimeInterval(3600))
+
+        let outcome = autoSwitch.handleLimit(message: "You've hit your session limit · resets 3:20pm (Europe/London)", now: now)
+        #expect(outcome == .waiting("“work” hit its session limit and everything it can switch to is used up",
+                                    until: now.addingTimeInterval(3600)))
+        #expect(autoSwitch.pendingRetry() == now.addingTimeInterval(3600))
+        #expect(store.activeProfile()?.name == "work")
+
+        #expect(autoSwitch.retry(now: now.addingTimeInterval(3601)) == .switched(from: "work", to: "personal"))
+        #expect(autoSwitch.pendingRetry() == nil)
+    }
+
+    @Test func doesntWaitWhenTheCurrentAccountResetsFirst() throws {
+        try saveAccounts()
+        let autoSwitch = AutoSwitch(store: store)
+        try autoSwitch.save(AutoSwitchSettings(groups: [FallbackGroup(name: "Work", members: ["work", "work2"])]))
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-10-17T11:15:00Z"))
+        exhaust("work2", until: now.addingTimeInterval(5 * 3600))
+
+        let outcome = autoSwitch.handleLimit(message: "You've hit your session limit · resets 3:20pm (Europe/London)", now: now)
+        #expect(outcome == .ignored("“work” hit its session limit; nothing it can switch to resets before it does"))
+        #expect(autoSwitch.pendingRetry() == nil)
+    }
+
+    @Test func retryLeavesAnAccountThatHasUsageAgain() throws {
+        try saveAccounts()
+        let autoSwitch = AutoSwitch(store: store)
+        try autoSwitch.save(AutoSwitchSettings(groups: [FallbackGroup(name: "Work", members: ["work", "work2"])]))
+        let now = Date()
+        exhaust("work", until: now.addingTimeInterval(-60))
+        autoSwitch.writeState(AutoSwitchState(retryAt: now))
+
+        #expect(autoSwitch.retry(now: now) == .ignored("“work” has usage again, so it stays"))
+        #expect(autoSwitch.pendingRetry() == nil)
+        #expect(store.activeProfile()?.name == "work")
     }
 }

@@ -71,7 +71,13 @@ extension AccountInfo {
 
 public enum AutoSwitchOutcome: Equatable, Sendable {
     case switched(from: String, to: String)
+    case waiting(String, until: Date)
     case ignored(String)
+}
+
+struct AutoSwitchState: Codable {
+    var lastSwitch: Date?
+    var retryAt: Date?
 }
 
 public struct AutoSwitch {
@@ -108,24 +114,43 @@ public struct AutoSwitch {
         try? save(settings)
     }
 
-    public static func fallback(from active: Profile, in profiles: [Profile], settings: AutoSwitchSettings,
-                                now: Date = Date()) -> Profile? {
+    static func chain(from active: Profile, in profiles: [Profile], settings: AutoSwitchSettings,
+                      now: Date) -> [[Profile]] {
+        var chain: [[Profile]] = []
         var group = settings.group(containing: active.name)
         var visited: Set<UUID> = []
         while let current = group, visited.insert(current.id).inserted {
-            let candidates = profiles.filter { profile in
+            chain.append(profiles.filter { profile in
                 guard profile.name != active.name, current.members.contains(profile.name),
-                      let tokens = profile.tokens, tokens.hasTokens, !tokens.isRefreshExpired(now: now) else { return false }
-                return profile.usage?.isExhausted(now: now) != true
-            }
-            let pick = candidates.min { a, b in
+                      let tokens = profile.tokens else { return false }
+                return tokens.hasTokens && !tokens.isRefreshExpired(now: now)
+            })
+            group = settings.group(current.next)
+        }
+        return chain
+    }
+
+    public static func fallback(from active: Profile, in profiles: [Profile], settings: AutoSwitchSettings,
+                                now: Date = Date()) -> Profile? {
+        for candidates in chain(from: active, in: profiles, settings: settings, now: now) {
+            let pick = candidates.filter { $0.usage?.isExhausted(now: now) != true }.min { a, b in
                 let pa = a.usage?.peakPercent(now: now) ?? 0, pb = b.usage?.peakPercent(now: now) ?? 0
                 return pa != pb ? pa < pb : a.name.localizedStandardCompare(b.name) == .orderedAscending
             }
             if let pick { return pick }
-            group = settings.group(current.next)
         }
         return nil
+    }
+
+    public static func nextAvailability(from active: Profile, in profiles: [Profile], settings: AutoSwitchSettings,
+                                        now: Date = Date()) -> Date? {
+        let times = chain(from: active, in: profiles, settings: settings, now: now).joined().compactMap { profile -> Date? in
+            guard let usage = profile.usage else { return now }
+            return usage.availableAt(now: now)
+        }
+        guard let earliest = times.min() else { return nil }
+        if let own = active.usage?.availableAt(now: now), own <= earliest { return nil }
+        return earliest
     }
 
     public func handleLimit(message: String, now: Date = Date()) -> AutoSwitchOutcome {
@@ -133,37 +158,68 @@ public struct AutoSwitch {
             return .ignored("not a usage limit: \(message)")
         }
         return withLock {
-            if let last = lastSwitch(), now.timeIntervalSince(last) < Self.debounce, now >= last {
+            if let last = readState().lastSwitch, now.timeIntervalSince(last) < Self.debounce, now >= last {
                 return .ignored("switched \(Int(now.timeIntervalSince(last)))s ago")
             }
             guard let active = store.activeProfile() else {
                 return .ignored("the current login isn't a saved account")
             }
             store.recordLimit(limit, for: active.name, now: now)
-            let settings = settings()
-            let hit = "“\(active.name)” hit its \(limit.window.lowercased()) limit"
-            guard settings.group(containing: active.name) != nil else {
-                return .ignored("\(hit); it isn't in a fallback group")
+            return switchOrWait(from: active.name, reason: "“\(active.name)” hit its \(limit.window.lowercased()) limit", now: now)
+        }
+    }
+
+    public func pendingRetry() -> Date? {
+        readState().retryAt
+    }
+
+    public func retry(now: Date = Date()) -> AutoSwitchOutcome {
+        withLock {
+            var state = readState()
+            state.retryAt = nil
+            writeState(state)
+            guard let active = store.activeProfile() else {
+                return .ignored("the current login isn't a saved account")
             }
-            let profiles = store.profiles()
-            guard let current = profiles.first(where: { $0.name == active.name }),
-                  let target = Self.fallback(from: current, in: profiles, settings: settings, now: now) else {
-                return .ignored("\(hit); no account in its fallback groups has usage left")
+            guard active.usage?.isExhausted(now: now) == true else {
+                return .ignored("“\(active.name)” has usage again, so it stays")
             }
+            return switchOrWait(from: active.name, reason: "“\(active.name)” is still used up", now: now)
+        }
+    }
+
+    func switchOrWait(from name: String, reason: String, now: Date) -> AutoSwitchOutcome {
+        let settings = settings()
+        guard settings.group(containing: name) != nil else {
+            return .ignored("\(reason); it isn't in a fallback group")
+        }
+        let profiles = store.profiles()
+        guard let active = profiles.first(where: { $0.name == name }) else {
+            return .ignored("\(reason); it's no longer saved")
+        }
+        if let target = Self.fallback(from: active, in: profiles, settings: settings, now: now) {
             do {
                 try store.use(target.name)
             } catch {
                 return .ignored("couldn't switch to “\(target.name)”: \(error.localizedDescription)")
             }
-            setLastSwitch(now)
-            return .switched(from: active.name, to: target.name)
+            writeState(AutoSwitchState(lastSwitch: now, retryAt: nil))
+            return .switched(from: name, to: target.name)
         }
+        guard let available = Self.nextAvailability(from: active, in: profiles, settings: settings, now: now) else {
+            return .ignored("\(reason); nothing it can switch to resets before it does")
+        }
+        var state = readState()
+        state.retryAt = max(available, now.addingTimeInterval(60))
+        writeState(state)
+        return .waiting("\(reason) and everything it can switch to is used up", until: state.retryAt!)
     }
 
     public func log(_ outcome: AutoSwitchOutcome, now: Date = Date()) {
         let text: String
         switch outcome {
         case .switched(let from, let to): text = "switched from “\(from)” to “\(to)”"
+        case .waiting(let reason, let until): text = "\(reason); trying again at \(ISO8601DateFormatter().string(from: until))"
         case .ignored(let reason): text = "didn't switch: \(reason)"
         }
         let line = "\(ISO8601DateFormatter().string(from: now)) \(text)\n"
@@ -182,16 +238,18 @@ public struct AutoSwitch {
     var lockURL: URL { store.paths.profileDir.appendingPathComponent("auto-switch.lock") }
     public var logURL: URL { store.paths.profileDir.appendingPathComponent("auto-switch.log") }
 
-    func lastSwitch() -> Date? {
+    func readState() -> AutoSwitchState {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
         guard let data = try? Data(contentsOf: stateURL),
-              let state = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let stamp = state["lastSwitch"] as? String else { return nil }
-        return ISO8601DateFormatter().date(from: stamp)
+              let state = try? decoder.decode(AutoSwitchState.self, from: data) else { return AutoSwitchState() }
+        return state
     }
 
-    func setLastSwitch(_ date: Date) {
-        let state = ["lastSwitch": ISO8601DateFormatter().string(from: date)]
-        try? JSONSerialization.data(withJSONObject: state).write(to: stateURL, options: .atomic)
+    func writeState(_ state: AutoSwitchState) {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try? encoder.encode(state).write(to: stateURL, options: .atomic)
     }
 
     func withLock<T>(_ body: () -> T) -> T {
