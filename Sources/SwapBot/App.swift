@@ -39,6 +39,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             withExtendedLifetime(delegate) { printMenu(menu) }
             return
         }
+        // Launched from inside a Claude Code session, the app inherits that session's variables, and the
+        // `claude` commands it runs then behave as that session's children instead of standing alone.
+        let session = ["CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "AI_AGENT", "CLAUDE_CODE_SESSION", "CLAUDE_CODE_MESSAGING",
+                       "CLAUDE_CODE_BRIDGE", "CLAUDE_CODE_CHILD", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_EXECPATH"]
+        for key in ProcessInfo.processInfo.environment.keys where session.contains(where: key.hasPrefix) {
+            unsetenv(key)
+        }
         let app = NSApplication.shared
         let delegate = AppDelegate()
         shared = delegate
@@ -48,21 +55,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     var statusItem: NSStatusItem!
-    private var loginTimer: Timer?
     private var retryTimer: Timer?
-    private var pendingLogin: PendingLogin?
     private var isBusy = false
     private var sleepDisabled = Power.sleepDisabled
-
-    private struct PendingLogin {
-        let before: String
-        let relogin: String?
-        let started: Date
-    }
 
     private var showsName: Bool {
         get { !UserDefaults.standard.bool(forKey: "hideNameInMenuBar") }
         set { UserDefaults.standard.set(!newValue, forKey: "hideNameInMenuBar") }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        LoginWindow.cancel()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -104,30 +107,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func retryAutoSwitch() {
         _ = try? CLI.run(["auto-switch", "retry"])
         refresh()
-    }
-
-    private func waitForLogin(_ pending: PendingLogin) {
-        pendingLogin = pending
-        loginTimer?.invalidate()
-        loginTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
-            MainActor.assumeIsolated { AppDelegate.shared?.checkLogin() }
-        }
-    }
-
-    private func checkLogin() {
-        guard let pending = pendingLogin else { return stopWaitingForLogin() }
-        if Date().timeIntervalSince(pending.started) > 15 * 60 {
-            stopWaitingForLogin()
-        } else if let fingerprint = try? CLI.run(["fingerprint"]), fingerprint != pending.before {
-            stopWaitingForLogin()
-            loginFinished(pending)
-        }
-    }
-
-    private func stopWaitingForLogin() {
-        pendingLogin = nil
-        loginTimer?.invalidate()
-        loginTimer = nil
     }
 
     private func updateLabel(_ status: Status?) {
@@ -414,6 +393,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func startLogin(relogin: String?) {
+        if LoginWindow.isOpen { return LoginWindow.bringToFront() }
         guard !isBusy, quitSessions(before: relogin == nil ? "adding an account" : "logging in again") else { return }
         runBusy(["record-usage"], failure: "Couldn't record usage") { [self] in openLogin(relogin: relogin) }
     }
@@ -421,26 +401,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func openLogin(relogin: String?) {
         let status = CLI.status()
         let email = relogin.flatMap { status?.profile($0)?.account?.email }
-        var command = "claude auth login"
-        if let email { command += " --email \(Sessions.shellQuote(email))" }
-
         if let active = status?.active {
             _ = try? CLI.run(["save", active, "--replace"])
         }
         do {
-            let before = try CLI.run(["fingerprint"])
-            try Sessions.openInTerminal(name: "login", """
-            \(command)
-            echo
-            echo "SwapBot will pick up the new login. You can close this window."
-            """)
-            waitForLogin(PendingLogin(before: before, relogin: relogin, started: Date()))
+            let claude = try CLI.run(["claude-path"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            try LoginWindow.start(claude: claude, account: relogin, email: email) { [self] in
+                loginFinished(relogin: relogin)
+            }
         } catch {
-            Prompts.error(error, title: "Couldn't open Terminal")
+            Prompts.error(error, title: "Couldn't start signing in")
         }
     }
 
-    private func loginFinished(_ pending: PendingLogin) {
+    private func loginFinished(relogin: String?) {
         refresh()
         guard let status = CLI.status(), let current = status.current else { return }
         let email = current.email ?? "unknown"
@@ -449,7 +423,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             do {
                 try CLI.run(["save", match, "--replace"])
                 var detail = "Signed in as \(email). Its saved login is up to date."
-                if let wanted = pending.relogin, wanted != match {
+                if let wanted = relogin, wanted != match {
                     detail = "You signed in as \(email), which is saved as “\(match)”, not “\(wanted)”. Updated “\(match)”."
                 }
                 Prompts.info("“\(match)” is ready", detail)

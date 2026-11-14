@@ -103,7 +103,7 @@ enum Command {
     #[command(hide = true)]
     LimitReached,
     #[command(hide = true)]
-    Fingerprint,
+    ClaudePath,
 }
 
 #[derive(clap::Args)]
@@ -207,8 +207,9 @@ fn run(command: Command, store: &Store) -> CliResult {
             limit_reached(store);
             Ok(())
         }
-        Command::Fingerprint => {
-            println!("{}", store.fingerprint());
+        Command::ClaudePath => {
+            let claude = claude::executable().ok_or("Couldn't find the claude command.")?;
+            println!("{}", claude.display());
             Ok(())
         }
     }

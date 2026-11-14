@@ -28,7 +28,7 @@ cargo install --path core          # just the swapbot command
 
 - **Switch:** click an account, or press its number. The account you're leaving is saved first, so refreshed tokens aren't lost.
 - **Usage:** hover over an account to see its session and weekly usage and when each resets. SwapBot records it with `claude -p /usage` when you switch away, and from the usage Claude Code caches in `~/.claude.json`.
-- **Add Account…** opens Terminal running `claude auth login`, then asks what to call the new account.
+- **Add Account…** runs `claude auth login` in the background and opens the sign-in page. If the page gives you a code, paste it into SwapBot's window. Then it asks what to call the new account.
 - **Manage Accounts:** Log In Again, Rename, Remove.
 - **Settings:** Auto-Switch, Launch at Login, showing the account name, and Stay Awake with Lid Closed (`pmset -a disablesleep`, which lasts until you turn it off).
 
